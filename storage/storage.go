@@ -16,22 +16,25 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"path/filepath"
 	"time"
 )
 
 var (
-	ErrorObjectAlreadyExists error = errors.New("the object already exists")
-	ErrorObjectDoesNotExist  error = errors.New("the object does not exist")
-	ErrorObjectIsDir         error = errors.New("the object is a directory")
-	ErrorCopyObject          error = errors.New("error while copying the object")
-	ErrorPutObject           error = errors.New("error while putting the object")
-	ErrorGetObject           error = errors.New("error while getting the object")
-	ErrorHeadObject          error = errors.New("error while getting the object head")
-	ErrorDeleteObject        error = errors.New("error while deleting the object")
-	ErrorURLJoinPath         error = errors.New("error during url.JoinPath")
-	ErrorListObjects         error = errors.New("error while listing objects")
+	ErrorObjectAlreadyExists   error = errors.New("the object already exists")
+	ErrorObjectDoesNotExist    error = errors.New("the object does not exist")
+	ErrorObjectIsDir           error = errors.New("the object is a directory")
+	ErrorCopyObject            error = errors.New("error while copying the object")
+	ErrorPutObject             error = errors.New("error while putting the object")
+	ErrorGetObject             error = errors.New("error while getting the object")
+	ErrorHeadObject            error = errors.New("error while getting the object head")
+	ErrorDeleteObject          error = errors.New("error while deleting the object")
+	ErrorURLJoinPath           error = errors.New("error during url.JoinPath")
+	ErrorListObjects           error = errors.New("error while listing objects")
+	ErrorOperationNotSupported error = errors.New("the object store does not support this operation")
+	ErrorWriter                error = errors.New("error while getting writer")
 )
 
 type DeltaStorageResult struct {
@@ -230,6 +233,11 @@ type ObjectStore interface {
 
 	// Will return an error if the destination already has an object.
 	RenameIfNotExists(from *Path, to *Path) error
+
+	// Allow use of an ObjectStore as an io.Writer
+	// If error is nil, then the returned function should be called with a defer to close resources
+	// Writer may not be supported for all store types
+	Writer(to *Path) (io.Writer, func(), error)
 }
 
 // / Wrapper around List that will perform paging if required

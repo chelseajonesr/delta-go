@@ -292,3 +292,7 @@ func (s *S3ObjectStore) ListAll(prefix *storage.Path) (storage.ListResult, error
 func (s *S3ObjectStore) IsListOrdered() bool {
 	return true
 }
+
+func (s *S3ObjectStore) Writer(to *storage.Path) (io.Writer, func(), error) {
+	return nil, nil, storage.ErrorOperationNotSupported
+}

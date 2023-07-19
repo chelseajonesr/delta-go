@@ -481,7 +481,7 @@ func TestCheckpointNoPartition(t *testing.T) {
 		t.Fatal("did not find checkpoint")
 	}
 
-	err = table.restoreCheckpoint(&checkpoints[len(checkpoints)-1])
+	err = table.restoreCheckpoint(&checkpoints[len(checkpoints)-1], nil)
 	if err != nil {
 		t.Fatal(err)
 	}

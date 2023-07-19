@@ -317,10 +317,12 @@ func readAndProcessStructsFromParquet[T any](parquetBytes []byte, process func(*
 	// during record assignments
 	structFieldNameToArrowIndexMappings := make(map[string]int, 100)
 	defaultType := reflect.TypeOf(defaultValue)
-	err = getStructFieldNameToArrowIndexMappings(defaultType, "Root", arrowFieldList, structFieldNameToArrowIndexMappings)
+	exclude := []string{"Root.Add", "Root.Remove"}
+	err = getStructFieldNameToArrowIndexMappings(defaultType, "Root", arrowFieldList, exclude, structFieldNameToArrowIndexMappings)
 	if err != nil {
 		return err
 	}
+
 	fileReader, err := pqarrow.NewFileReader(parquetReader, pqarrow.ArrowReadProperties{BatchSize: 1, Parallel: false}, memory.DefaultAllocator)
 	if err != nil {
 		return err
@@ -384,7 +386,7 @@ func writeStructsToParquetBytes[T any](values []T) ([]byte, error) {
 	// during record assignments
 	structFieldNameToArrowIndexMappings := make(map[string]int, 100)
 	valueType := reflect.TypeOf(defaultValue)
-	err = getStructFieldNameToArrowIndexMappings(valueType, "Root", arrowFieldList, structFieldNameToArrowIndexMappings)
+	err = getStructFieldNameToArrowIndexMappings(valueType, "Root", arrowFieldList, nil, structFieldNameToArrowIndexMappings)
 	if err != nil {
 		return nil, err
 	}
@@ -577,16 +579,26 @@ func appendGoValueToArrowBuilder(goValue reflect.Value, builder array.Builder, g
 }
 
 // Map go field names to parquet field names, and also to the arrow field index
-func getStructFieldNameToArrowIndexMappings(goType reflect.Type, goNamePrefix string, arrowFields []arrow.Field, goNameArrowIndexMap map[string]int) error {
+func getStructFieldNameToArrowIndexMappings(goType reflect.Type, goNamePrefix string, arrowFields []arrow.Field, goNameExclude []string, goNameArrowIndexMap map[string]int) error {
 	for goType.Kind() == reflect.Pointer {
 		goType = goType.Elem()
 	}
 
 	switch goType.Kind() {
 	case reflect.Struct:
+		skippedFields := 0
+	processGoStructField:
 		for i := 0; i < goType.NumField(); i++ {
 			var parquetName string
 			field := goType.Field(i)
+			fieldName := goNamePrefix + "." + field.Name
+
+			for _, exclude := range goNameExclude {
+				if exclude == fieldName {
+					skippedFields++
+					continue processGoStructField
+				}
+			}
 			tag := field.Tag
 			if ptags, ok := tag.Lookup("parquet"); ok {
 				if ptags != "-" {
@@ -608,12 +620,11 @@ func getStructFieldNameToArrowIndexMappings(goType reflect.Type, goNamePrefix st
 				}
 			}
 			if len(parquetName) > 0 {
-				fieldName := goNamePrefix + "." + field.Name
 				var arrowField arrow.Field
 				found := false
 				for arrowIndex := 0; arrowIndex < len(arrowFields); arrowIndex++ {
 					if arrowFields[arrowIndex].Name == parquetName {
-						goNameArrowIndexMap[fieldName] = arrowIndex
+						goNameArrowIndexMap[fieldName] = arrowIndex - skippedFields
 						arrowField = arrowFields[arrowIndex]
 						found = true
 						break
@@ -625,7 +636,7 @@ func getStructFieldNameToArrowIndexMappings(goType reflect.Type, goNamePrefix st
 
 				arrowStructMemberFields := arrowFieldsFromField(arrowField)
 				if arrowStructMemberFields != nil {
-					err := getStructFieldNameToArrowIndexMappings(field.Type, fieldName, arrowStructMemberFields, goNameArrowIndexMap)
+					err := getStructFieldNameToArrowIndexMappings(field.Type, fieldName, arrowStructMemberFields, goNameExclude, goNameArrowIndexMap)
 					if err != nil {
 						return err
 					}
@@ -643,7 +654,7 @@ func getStructFieldNameToArrowIndexMappings(goType reflect.Type, goNamePrefix st
 			arrowStructMemberFields = arrowFieldsFromField(arrowStructMemberFields[1])
 		}
 		if arrowStructMemberFields != nil {
-			err := getStructFieldNameToArrowIndexMappings(field, goNamePrefix, arrowStructMemberFields, goNameArrowIndexMap)
+			err := getStructFieldNameToArrowIndexMappings(field, goNamePrefix, arrowStructMemberFields, goNameExclude, goNameArrowIndexMap)
 			if err != nil {
 				return err
 			}

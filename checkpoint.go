@@ -59,6 +59,8 @@ type CheckpointConfiguration struct {
 	// Disable any cleanup after checkpointing, even if it was enabled in the table configuration.
 	// Defaults to false.
 	DisableCleanup bool
+	// Configure use of on-disk intermediate storage to reduce memory requirements
+	ReadWriteConfiguration ReadWriteTableConfiguration
 }
 
 func NewCheckpointConfiguration() *CheckpointConfiguration {

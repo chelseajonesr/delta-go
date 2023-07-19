@@ -13,12 +13,26 @@
 package delta
 
 import (
+	"bytes"
+	"context"
 	"errors"
 	"fmt"
+	"os"
 	"reflect"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
+
+	"github.com/apache/arrow/go/v13/arrow"
+	"github.com/apache/arrow/go/v13/arrow/array"
+	"github.com/apache/arrow/go/v13/arrow/memory"
+	"github.com/apache/arrow/go/v13/parquet"
+	"github.com/apache/arrow/go/v13/parquet/compress"
+	"github.com/apache/arrow/go/v13/parquet/file"
+	"github.com/apache/arrow/go/v13/parquet/pqarrow"
+	"github.com/rivian/delta-go/storage"
+	"github.com/rivian/delta-go/storage/filestore"
 )
 
 type DeltaTableState[RowType any, PartitionType any] struct {
@@ -41,6 +55,8 @@ type DeltaTableState[RowType any, PartitionType any] struct {
 	// retention period for log entries as time.Duration (nanoseconds)
 	LogRetention            time.Duration
 	EnableExpiredLogCleanup bool
+	// Add and remove actions that have been written to disk
+	FilesOnDisk []storage.Path
 }
 
 var (
@@ -165,24 +181,34 @@ func (tableState *DeltaTableState[RowType, PartitionType]) processAction(actionI
 }
 
 // / Merges new state information into our state
-func (tableState *DeltaTableState[RowType, PartitionType]) merge(newTableState *DeltaTableState[RowType, PartitionType]) error {
-	// Remove deleted files from existing added files
-	for k := range newTableState.Tombstones {
-		delete(tableState.Files, k)
-	}
+func (tableState *DeltaTableState[RowType, PartitionType]) merge(newTableState *DeltaTableState[RowType, PartitionType], config *ReadWriteTableConfiguration) error {
+	useDisk := config != nil && config.WorkingStore != nil
 
-	// Add deleted file tombstones to state so they're available for vacuum
-	for k, v := range newTableState.Tombstones {
-		tableState.Tombstones[k] = v
-	}
-
-	// If files were deleted and then re-added, remove from updated tombstones
-	for k := range newTableState.Files {
-		delete(tableState.Tombstones, k)
-	}
-
-	for k, v := range newTableState.Files {
-		tableState.Files[k] = v
+	// In memory file updates
+	if !useDisk {
+		for k, v := range newTableState.Tombstones {
+			// Remove deleted files from existing added files
+			delete(tableState.Files, k)
+			// Add deleted file tombstones to state so they're available for vacuum
+			tableState.Tombstones[k] = v
+		}
+		for k, v := range newTableState.Files {
+			// If files were deleted and then re-added, remove from updated tombstones
+			delete(tableState.Tombstones, k)
+			tableState.Files[k] = v
+		}
+	} else {
+		// On disk file updates
+		// TODO if I proceed with this approach it'll need to be more integrated with the Storage abstraction
+		fos := config.WorkingStore.(*filestore.FileObjectStore)
+		// TODO we can parallelize calls to updateOnDiskState
+		for _, f := range tableState.FilesOnDisk {
+			path := storage.PathFromIter([]string{fos.BaseURI.Raw, f.Raw})
+			err := updateOnDiskState(path, tableState.Files, tableState.Tombstones)
+			if err != nil {
+				return err
+			}
+		}
 	}
 
 	if newTableState.MinReaderVersion > 0 {
@@ -211,19 +237,187 @@ func (tableState *DeltaTableState[RowType, PartitionType]) merge(newTableState *
 	return nil
 }
 
-func stateFromCheckpoint[RowType any, PartitionType any](table *DeltaTable[RowType, PartitionType], checkpoint *CheckPoint) (*DeltaTableState[RowType, PartitionType], error) {
+func updateOnDiskState[RowType any, PartitionType any](path storage.Path, newAdds map[string]AddPartitioned[RowType, PartitionType], newRemoves map[string]Remove) error {
+	changed := false
+	// TODO - profile with mmap on and off
+	// If it doesn't improve performance we can use NewParquetReader() instead
+	mmap := true
+	fileClosed := false
+	reader, err := file.OpenParquetFile(path.Raw, mmap)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if !fileClosed {
+			reader.Close()
+		}
+	}()
+	arrowRdr, err := pqarrow.NewFileReader(reader, pqarrow.ArrowReadProperties{Parallel: true, BatchSize: 10}, memory.DefaultAllocator)
+	if err != nil {
+		return err
+	}
+	arrowSchema, err := arrowRdr.Schema()
+	if err != nil {
+		return err
+	}
+	// TODO - we can expect this to be the same for each file
+	var addFieldIndex, removeFieldIndex, addPathFieldIndex, removePathFieldIndex int = -1, -1, -1, -1
+	indices := arrowSchema.FieldIndices("add")
+	if indices == nil || len(indices) != 1 {
+		return errors.Join(ErrorReadingCheckpoint, errors.New("intermediate checkpoint file schema has invalid add column index"))
+	}
+	addFieldIndex = indices[0]
+	indices = arrowSchema.FieldIndices("remove")
+	if indices == nil || len(indices) != 1 {
+		return errors.Join(ErrorReadingCheckpoint, errors.New("intermediate checkpoint file schema has invalid remove column index"))
+	}
+	removeFieldIndex = indices[0]
+	// Locate the add.Path and remove.Path field locations
+	addPathFieldIndex, ok := arrowSchema.Field(addFieldIndex).Type.(*arrow.StructType).FieldIdx("path")
+	if !ok {
+		return errors.Join(ErrorReadingCheckpoint, errors.New("intermediate checkpoint file schema has invalid add.path column index"))
+	}
+	removePathFieldIndex, ok = arrowSchema.Field(removeFieldIndex).Type.(*arrow.StructType).FieldIdx("path")
+	if !ok {
+		return errors.Join(ErrorReadingCheckpoint, errors.New("intermediate checkpoint file schema has invalid remove.path column index"))
+	}
+
+	// TODO profile whether it's worth picking out the columns we want here
+	tbl, err := arrowRdr.ReadTable(context.TODO())
+	if err != nil {
+		return err
+	}
+	defer tbl.Release()
+
+	tableReader := array.NewTableReader(tbl, 0)
+	defer tableReader.Release()
+
+	// Only expect one chunk per table, but iterate anyways
+	records := make([]arrow.Record, 0, 1)
+	for tableReader.Next() {
+		record := tableReader.Record()
+		addPathArray := record.Column(addFieldIndex).(*array.Struct).Field(addPathFieldIndex).(*array.String)
+		removePathArray := record.Column(removeFieldIndex).(*array.Struct).Field(removePathFieldIndex).(*array.String)
+
+		// Locate changes to the add and remove columns
+		toChangeAddRows := make([]int64, 0, len(newRemoves))
+		toChangeRemoveRows := make([]int64, 0, len(newAdds))
+		// Note that although record.NumRows() returns an int64, both the IsNull() and Value() functions accept ints
+		for row := 0; row < int(record.NumRows()); row++ {
+			// Is there an add action in this row
+			if !addPathArray.IsNull(row) {
+				// If the file is now in tombstones, it needs to be removed from the add file list
+				_, ok := newRemoves[addPathArray.Value(row)]
+				if ok {
+					toChangeAddRows = append(toChangeAddRows, int64(row))
+				}
+			}
+			// Is there a remove action in this row
+			if !removePathArray.IsNull(row) {
+				// If the file has been re-added, it needs to be removed from the tombstones
+				_, ok := newAdds[removePathArray.Value(row)]
+				if ok {
+					toChangeRemoveRows = append(toChangeRemoveRows, int64(row))
+				}
+			}
+		}
+
+		// We need to copy the add and remove columns, including children, nulling the changed rows as we go
+		var changedAdd arrow.Array
+		var changedRemove arrow.Array
+		if len(toChangeAddRows) > 0 {
+			changedAdd, err = copyArrowArrayWithNulls(record.Column(addFieldIndex), toChangeAddRows)
+			if err != nil {
+				return err
+			}
+			record.SetColumn(addFieldIndex, changedAdd)
+			changed = true
+		}
+		if len(toChangeRemoveRows) > 0 {
+			changedRemove, err = copyArrowArrayWithNulls(record.Column(removeFieldIndex), toChangeRemoveRows)
+			if err != nil {
+				return err
+			}
+			record.SetColumn(removeFieldIndex, changedRemove)
+			changed = true
+		}
+
+		records = append(records, record)
+	}
+
+	if changed {
+		// Close the file then overwrite it
+		reader.Close()
+		fileClosed = true
+		props := parquet.NewWriterProperties(
+			parquet.WithCompression(compress.Codecs.Zstd),
+		)
+		w, err := os.OpenFile(path.Raw, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0777)
+		if err != nil {
+			return err
+		}
+		writer, err := pqarrow.NewFileWriter(arrowSchema, w, props, pqarrow.DefaultWriterProps())
+		if err != nil {
+			return err
+		}
+		defer writer.Close()
+		for _, record := range records {
+			err = writer.Write(record)
+			if err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// Copy arrow array data, setting any rows in nullRows to null
+func copyArrowArrayWithNulls(in arrow.Array, nullRows []int64) (arrow.Array, error) {
+	recordBuilder := array.NewStructBuilder(memory.DefaultAllocator, in.DataType().(*arrow.StructType))
+	var copiedComponents []arrow.Array = make([]arrow.Array, 0, len(nullRows)+1)
+	lastIndexCopied := int64(-1)
+	for _, nullIndex := range nullRows {
+		// Copy any uncopied records before this null record
+		if nullIndex > lastIndexCopied+1 {
+			copiedSlice := array.NewSlice(in, lastIndexCopied+1, nullIndex)
+			defer copiedSlice.Release()
+			copiedComponents = append(copiedComponents, copiedSlice)
+		}
+		// Create a single length array that's all null
+		recordBuilder.AppendNull()
+		// NewStructArray() resets the StructBuilder so we don't have to
+		nullArray := recordBuilder.NewStructArray()
+		defer nullArray.Release()
+		copiedComponents = append(copiedComponents, nullArray)
+		lastIndexCopied = nullIndex
+	}
+	// Copy any uncopied records after the last null
+	if in.Len() > int(lastIndexCopied)+1 {
+		copiedSlice := array.NewSlice(in, lastIndexCopied+1, int64(in.Len()))
+		defer copiedSlice.Release()
+		copiedComponents = append(copiedComponents, copiedSlice)
+	}
+	return array.Concatenate(copiedComponents, memory.DefaultAllocator)
+}
+
+func stateFromCheckpoint[RowType any, PartitionType any](table *DeltaTable[RowType, PartitionType], checkpoint *CheckPoint, config *ReadWriteTableConfiguration) (*DeltaTableState[RowType, PartitionType], error) {
 	newState := NewDeltaTableState[RowType, PartitionType](checkpoint.Version)
 	checkpointDataPaths := table.GetCheckpointDataPaths(checkpoint)
-	for _, location := range checkpointDataPaths {
+	if config != nil && config.WorkingStore != nil {
+		newState.FilesOnDisk = make([]storage.Path, 0, len(checkpointDataPaths))
+	}
+	for i, location := range checkpointDataPaths {
 		checkpointBytes, err := table.Store.Get(&location)
 		if err != nil {
 			return nil, err
 		}
 		if len(checkpointBytes) > 0 {
-			err = processCheckpointBytes(checkpointBytes, newState, table)
+			err = processCheckpointBytes(checkpointBytes, newState, table, i, config)
 			if err != nil {
 				return nil, err
 			}
+		} else {
+			return nil, errors.Join(ErrorCheckpointIncomplete, fmt.Errorf("zero size checkpoint at %s", location.Raw))
 		}
 	}
 	return newState, nil
@@ -235,31 +429,32 @@ func isPartitionTypeEmpty[PartitionType any]() bool {
 	return structType.NumField() == 0
 }
 
-func processCheckpointBytes[RowType any, PartitionType any](checkpointBytes []byte, tableState *DeltaTableState[RowType, PartitionType], table *DeltaTable[RowType, PartitionType]) (returnErr error) {
+func processCheckpointBytes[RowType any, PartitionType any](checkpointBytes []byte, tableState *DeltaTableState[RowType, PartitionType], table *DeltaTable[RowType, PartitionType], part int, config *ReadWriteTableConfiguration) (returnErr error) {
 	// Determine whether partitioned
 	isPartitioned := !isPartitionTypeEmpty[PartitionType]()
 	if isPartitioned {
-		return processCheckpointBytesWithAddSpecified[RowType, PartitionType, AddPartitioned[RowType, PartitionType]](checkpointBytes, tableState, table)
+		return processCheckpointBytesWithAddSpecified[RowType, PartitionType, AddPartitioned[RowType, PartitionType]](checkpointBytes, tableState, table, part, config)
 	} else {
-		return processCheckpointBytesWithAddSpecified[RowType, PartitionType, Add[RowType]](checkpointBytes, tableState, table)
+		return processCheckpointBytesWithAddSpecified[RowType, PartitionType, Add[RowType]](checkpointBytes, tableState, table, part, config)
 	}
 }
 
 // / Update a table state with the contents of a checkpoint file
-func processCheckpointBytesWithAddSpecified[RowType any, PartitionType any, AddType AddPartitioned[RowType, PartitionType] | Add[RowType]](checkpointBytes []byte, tableState *DeltaTableState[RowType, PartitionType], table *DeltaTable[RowType, PartitionType]) error {
+func processCheckpointBytesWithAddSpecified[RowType any, PartitionType any, AddType AddPartitioned[RowType, PartitionType] | Add[RowType]](checkpointBytes []byte, tableState *DeltaTableState[RowType, PartitionType], table *DeltaTable[RowType, PartitionType], part int, config *ReadWriteTableConfiguration) error {
+	useDisk := config != nil && config.WorkingFolder != nil
 	var processFunc = func(checkpointEntry *CheckpointEntry[RowType, PartitionType, AddType]) error {
 		var action Action
 		if checkpointEntry.Add != nil {
 			action = checkpointEntry.Add
+		}
+		if checkpointEntry.Remove != nil {
+			action = checkpointEntry.Remove
 		}
 		if checkpointEntry.MetaData != nil {
 			action = checkpointEntry.MetaData
 		}
 		if checkpointEntry.Protocol != nil {
 			action = checkpointEntry.Protocol
-		}
-		if checkpointEntry.Remove != nil {
-			action = checkpointEntry.Remove
 		}
 		if checkpointEntry.Txn != nil {
 			action = checkpointEntry.Txn
@@ -271,11 +466,154 @@ func processCheckpointBytesWithAddSpecified[RowType any, PartitionType any, AddT
 				return err
 			}
 		} else {
-			return errors.New("no action found in checkpoint record")
+			if !useDisk {
+				return errors.New("no action found in checkpoint record")
+			}
 		}
 		return nil
 	}
-	return readAndProcessStructsFromParquet(checkpointBytes, processFunc)
+
+	bytesReader := bytes.NewReader(checkpointBytes)
+	parquetReader, err := file.NewParquetReader(bytesReader)
+	if err != nil {
+		return err
+	}
+
+	defaultValue := new(CheckpointEntry[RowType, PartitionType, AddType])
+	parquetSchema := parquetReader.MetaData().Schema
+	fileReader, err := pqarrow.NewFileReader(parquetReader, pqarrow.ArrowReadProperties{BatchSize: 10, Parallel: true}, memory.DefaultAllocator)
+	if err != nil {
+		return err
+	}
+	arrowSchema, err := fileReader.Schema()
+	if err != nil {
+		return err
+	}
+	arrowFieldList := arrowSchema.Fields()
+	inMemoryCols := make([]int, 0, 150)
+	onDiskCols := make([]int, 0, 150)
+
+	for i := 0; i < parquetSchema.NumColumns(); i++ {
+		columnPath := parquetSchema.Column(i).ColumnPath().String()
+		if useDisk && (strings.HasPrefix(columnPath, "add") || strings.HasPrefix(columnPath, "remove")) {
+			onDiskCols = append(onDiskCols, i)
+		} else {
+			inMemoryCols = append(inMemoryCols, i)
+		}
+	}
+
+	// Get mappings between struct member names and parquet/arrow names so we don't have to look them up repeatedly
+	// during record assignments
+	inMemoryIndexMappings := make(map[string]int, 100)
+	defaultType := reflect.TypeOf(defaultValue)
+	var fieldExclusions []string
+	if useDisk {
+		fieldExclusions = []string{"Root.Add", "Root.Remove"}
+	}
+	err = getStructFieldNameToArrowIndexMappings(defaultType, "Root", arrowFieldList, fieldExclusions, inMemoryIndexMappings)
+	if err != nil {
+		return err
+	}
+	var onDiskIndexMappings map[string]int
+	if useDisk {
+		onDiskIndexMappings = make(map[string]int, 100)
+		err = getStructFieldNameToArrowIndexMappings(defaultType, "Root", arrowFieldList, []string{"Root.Txn", "Root.MetaData", "Root.Protocol"}, onDiskIndexMappings)
+		if err != nil {
+			return err
+		}
+	}
+
+	testingRead := true
+	// Read a row group at a time; process in-memory actions
+	if testingRead {
+		for i := 0; i < parquetReader.NumRowGroups(); i++ {
+			tbl, err := fileReader.ReadRowGroups(context.TODO(), inMemoryCols, []int{i})
+			if err != nil {
+				return err
+			}
+			defer tbl.Release()
+
+			tableReader := array.NewTableReader(tbl, 0)
+			defer tableReader.Release()
+
+			for tableReader.Next() {
+				// the record contains a batch of rows
+				record := tableReader.Record()
+
+				entries := make([]*CheckpointEntry[RowType, PartitionType, AddType], record.NumRows())
+				entryValues := make([]reflect.Value, record.NumRows())
+				for j := int64(0); j < record.NumRows(); j++ {
+					t := new(CheckpointEntry[RowType, PartitionType, AddType])
+					entries[j] = t
+					entryValues[j] = reflect.ValueOf(t)
+				}
+
+				goStructFromArrowArrays(entryValues, record.Columns(), "Root", inMemoryIndexMappings)
+				for j := int64(0); j < record.NumRows(); j++ {
+					err = processFunc(entries[j])
+					if err != nil {
+						return err
+					}
+				}
+			}
+		}
+	}
+
+	if useDisk {
+		onDiskFile := storage.PathFromIter([]string{config.WorkingFolder.Raw, fmt.Sprintf("intermediate.%d.parquet", part)})
+		config.WorkingStore.Put(&onDiskFile, checkpointBytes)
+		tableState.FilesOnDisk = append(tableState.FilesOnDisk, onDiskFile)
+		// Read add and remove columns and write them to disk
+		// New schema with just the add/remove columns
+		// writeFields := make([]arrow.Field, 0, arrowSchema.NumFields())
+		// for i := 0; i < arrowSchema.NumFields(); i++ {
+		// 	name := arrowSchema.Field(i).Name
+		// 	if strings.HasPrefix(name, "add") || strings.HasPrefix(name, "remove") {
+		// 		writeFields = append(writeFields, arrowSchema.Field(i))
+		// 	}
+		// }
+		// writeMetadata := arrowSchema.Metadata()
+		// writeSchema := arrow.NewSchema(writeFields, &writeMetadata)
+
+		// storeWriter, closeFunc, err := config.WorkingStore.Writer(&onDiskFile)
+		// if err != nil {
+		// 	return err
+		// }
+		// defer closeFunc()
+		// tableState.FilesOnDisk = append(tableState.FilesOnDisk, onDiskFile)
+
+		// props := parquet.NewWriterProperties(
+		// 	parquet.WithCompression(compress.Codecs.Snappy),
+		// )
+		// fileWriter, err := pqarrow.NewFileWriter(writeSchema, storeWriter, props, pqarrow.DefaultWriterProps())
+		// if err != nil {
+		// 	return err
+		// }
+		// defer fileWriter.Close()
+
+		// for i := 0; i < parquetReader.NumRowGroups(); i++ {
+		// 	tbl, err := fileReader.ReadRowGroups(context.TODO(), onDiskCols, []int{i})
+		// 	if err != nil {
+		// 		return err
+		// 	}
+		// 	defer tbl.Release()
+
+		// 	tableReader := array.NewTableReader(tbl, 0)
+		// 	defer tableReader.Release()
+
+		// 	for tableReader.Next() {
+		// 		// the record contains a batch of rows
+		// 		record := tableReader.Record()
+
+		// 		err = fileWriter.Write(record)
+		// 		if err != nil {
+		// 			return err
+		// 		}
+		// 	}
+		// }
+	}
+
+	return nil
 }
 
 // / Prepare the table state for checkpointing by updating tombstones

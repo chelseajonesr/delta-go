@@ -71,6 +71,12 @@ type DeltaTable[RowType any, PartitionType any] struct {
 	VersionTimestamp map[int64]time.Time
 }
 
+type ReadWriteTableConfiguration struct {
+	// Use an intermediate on-disk storage location to reduce memory
+	WorkingStore  storage.ObjectStore
+	WorkingFolder *storage.Path
+}
+
 // Create a new Delta Table struct without loading any data from backing storage.
 //
 // NOTE: This is for advanced users. If you don't know why you need to use this method, please
@@ -177,7 +183,7 @@ func (table *DeltaTable[RowType, PartitionType]) Create(metadata DeltaTableMetaD
 	if err != nil {
 		return err
 	}
-	table.State.merge(newState)
+	table.State.merge(newState, nil)
 
 	// If either version is too high, we return an error, but we still create the table first
 	if protocol.MinReaderVersion > MAX_READER_VERSION_SUPPORTED {
@@ -237,11 +243,16 @@ func (table *DeltaTable[RowType, PartitionType]) ReadCommitVersion(version int64
 
 // / Load the table state at the latest version
 func (table *DeltaTable[RowType, PartitionType]) Load() error {
-	return table.LoadVersion(nil)
+	return table.LoadVersionWithConfiguration(nil, nil)
 }
 
 // / Load the table state at the specified version
 func (table *DeltaTable[RowType, PartitionType]) LoadVersion(version *int64) error {
+	return table.LoadVersionWithConfiguration(version, nil)
+}
+
+// / Load the table state at the specified version
+func (table *DeltaTable[RowType, PartitionType]) LoadVersionWithConfiguration(version *int64, config *ReadWriteTableConfiguration) error {
 	table.LastCheckPoint = nil
 	table.State = *NewDeltaTableState[RowType, PartitionType](-1)
 
@@ -270,7 +281,7 @@ func (table *DeltaTable[RowType, PartitionType]) LoadVersion(version *int64) err
 
 		// Checkpoints are sorted ascending
 		checkpointIndex := len(checkpoints) - 1
-		err = table.restoreCheckpoint(&checkpoints[checkpointIndex])
+		err = table.restoreCheckpoint(&checkpoints[checkpointIndex], config)
 		if err == nil {
 			// We successfully loaded a checkpoint
 			checkpointLoadError = nil
@@ -297,7 +308,7 @@ func (table *DeltaTable[RowType, PartitionType]) LoadVersion(version *int64) err
 		}
 	}
 
-	err = table.updateIncremental(version)
+	err = table.updateIncremental(version, config)
 	if err != nil {
 		// If we happened to get both a checkpoint read error and an incremental load error, it may be helpful to return both
 		return errors.Join(err, checkpointLoadError)
@@ -415,8 +426,8 @@ func (table *DeltaTable[RowType, PartitionType]) GetCheckpointDataPaths(checkpoi
 }
 
 // / Update the table state from the given checkpoint
-func (table *DeltaTable[RowType, PartitionType]) restoreCheckpoint(checkpoint *CheckPoint) error {
-	state, err := stateFromCheckpoint(table, checkpoint)
+func (table *DeltaTable[RowType, PartitionType]) restoreCheckpoint(checkpoint *CheckPoint, config *ReadWriteTableConfiguration) error {
+	state, err := stateFromCheckpoint(table, checkpoint, config)
 	if err != nil {
 		return err
 	}
@@ -427,7 +438,7 @@ func (table *DeltaTable[RowType, PartitionType]) restoreCheckpoint(checkpoint *C
 // / Updates the DeltaTable to the latest version by incrementally applying newer versions.
 // / It assumes that the table is already updated to the current version `self.version`.
 // / This function does not look for checkpoints
-func (table *DeltaTable[RowType, PartitionType]) updateIncremental(maxVersion *int64) error {
+func (table *DeltaTable[RowType, PartitionType]) updateIncremental(maxVersion *int64, config *ReadWriteTableConfiguration) error {
 	for {
 		if maxVersion != nil && table.State.Version == *maxVersion {
 			return nil
@@ -444,7 +455,7 @@ func (table *DeltaTable[RowType, PartitionType]) updateIncremental(maxVersion *i
 		if err != nil {
 			return err
 		}
-		err = table.State.merge(newState)
+		err = table.State.merge(newState, config)
 		if err != nil {
 			return err
 		}
@@ -531,7 +542,7 @@ func validateCheckpointAndCleanup[RowType any, PartitionType any](table *DeltaTa
 		return ErrorReadingCheckpoint
 	}
 	checkpoint := checkpoints[len(checkpoints)-1]
-	err = table.restoreCheckpoint(&checkpoint)
+	err = table.restoreCheckpoint(&checkpoint, nil)
 	if err != nil {
 		return err
 	}
@@ -867,8 +878,11 @@ func NewDeltaTransactionOptions() *DeltaTransactionOptions {
 // / Open the table at this specific version
 // / If the table reader or writer version is greater than the client supports, the table will still be opened, but an error will also be returned
 func OpenTableWithVersion[RowType any, PartitionType any](store storage.ObjectStore, lock lock.Locker, stateStore state.StateStore, version int64) (*DeltaTable[RowType, PartitionType], error) {
+	return OpenTableWithVersionAndConfiguration[RowType, PartitionType](store, lock, stateStore, version, nil)
+}
+func OpenTableWithVersionAndConfiguration[RowType any, PartitionType any](store storage.ObjectStore, lock lock.Locker, stateStore state.StateStore, version int64, config *ReadWriteTableConfiguration) (*DeltaTable[RowType, PartitionType], error) {
 	table := NewDeltaTable[RowType, PartitionType](store, lock, stateStore)
-	err := table.LoadVersion(&version)
+	err := table.LoadVersionWithConfiguration(&version, config)
 	if err != nil {
 		return nil, err
 	}
@@ -887,8 +901,11 @@ func OpenTableWithVersion[RowType any, PartitionType any](store storage.ObjectSt
 // / Open the latest version of the table
 // / If the table reader or writer version is greater than the client supports, the table will still be opened, but an error will also be returned
 func OpenTable[RowType any, PartitionType any](store storage.ObjectStore, lock lock.Locker, stateStore state.StateStore) (*DeltaTable[RowType, PartitionType], error) {
+	return OpenTableWithConfiguration[RowType, PartitionType](store, lock, stateStore, nil)
+}
+func OpenTableWithConfiguration[RowType any, PartitionType any](store storage.ObjectStore, lock lock.Locker, stateStore state.StateStore, config *ReadWriteTableConfiguration) (*DeltaTable[RowType, PartitionType], error) {
 	table := NewDeltaTable[RowType, PartitionType](store, lock, stateStore)
-	err := table.LoadVersion(nil)
+	err := table.LoadVersionWithConfiguration(nil, config)
 	if err != nil {
 		return nil, err
 	}
