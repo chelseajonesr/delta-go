@@ -237,7 +237,7 @@ type ObjectStore interface {
 	// Allow use of an ObjectStore as an io.Writer
 	// If error is nil, then the returned function should be called with a defer to close resources
 	// Writer may not be supported for all store types
-	Writer(to *Path) (io.Writer, func(), error)
+	Writer(to *Path, flag int) (io.Writer, func(), error)
 }
 
 // / Wrapper around List that will perform paging if required

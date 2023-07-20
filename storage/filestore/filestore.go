@@ -226,13 +226,13 @@ func (s *FileObjectStore) IsListOrdered() bool {
 	return true
 }
 
-func (s *FileObjectStore) Writer(location *storage.Path) (io.Writer, func(), error) {
+func (s *FileObjectStore) Writer(location *storage.Path, flag int) (io.Writer, func(), error) {
 	writePath := filepath.Join(s.BaseURI.Raw, location.Raw)
 	err := os.MkdirAll(filepath.Dir(writePath), 0700)
 	if err != nil {
 		return nil, nil, errors.Join(storage.ErrorWriter, err)
 	}
 
-	f, err := os.OpenFile(writePath, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0700)
+	f, err := os.OpenFile(writePath, os.O_WRONLY|flag, 0700)
 	return f, func() { f.Close() }, err
 }

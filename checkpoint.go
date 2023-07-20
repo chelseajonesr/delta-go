@@ -213,6 +213,8 @@ func createCheckpointWithAddType[RowType any, PartitionType any, AddType AddPart
 	totalRows := len(tableState.Files) + len(tableState.Tombstones) + len(tableState.AppTransactionVersion) + 2
 	numParts := int32(((totalRows - 1) / checkpointConfiguration.MaxRowsPerPart) + 1)
 
+	// TODO the following comment may not apply after refactoring
+
 	// From https://github.com/delta-io/delta/blob/master/PROTOCOL.md#checkpoints:
 	// When writing multi-part checkpoints, the data must be clustered (either through hash or range partitioning)
 	// by the 'path' of an added or removed file, or null otherwise. This ensures deterministic content in each

@@ -369,16 +369,40 @@ func readAndProcessStructsFromParquet[T any](parquetBytes []byte, process func(*
 
 // Write helpers
 
-func writeStructsToParquetBytes[T any](values []T) ([]byte, error) {
-	buf := new(bytes.Buffer)
+// Return a typed RecordBuilder
+// the RecordBuilder needs to be released
+func newRecordBuilder[T any]() (*array.RecordBuilder, *arrow.Schema, error) {
 	defaultValue := new(T)
 	parquetSchema, err := schema.NewSchemaFromStruct(defaultValue)
+
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	arrowSchema, err := pqarrow.FromParquet(parquetSchema, nil, nil)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
+	}
+
+	return array.NewRecordBuilder(memory.DefaultAllocator, arrowSchema), arrowSchema, nil
+}
+
+// Return a StructBuilder with all nested values filled in
+// The StructBuilder needs to be released
+func newStructBuilderFromStructs[T any](values []T) (*array.StructBuilder, *arrow.Schema, error) {
+	return newStructBuilderFromStructsPrependNulls(values, 0)
+}
+
+// Return a StructBuilder with the given number of nulls at the beginning and then all nested values filled in from the values
+// The StructBuilder needs to be released
+func newStructBuilderFromStructsPrependNulls[T any](values []T, prependNulls int) (*array.StructBuilder, *arrow.Schema, error) {
+	defaultValue := new(T)
+	parquetSchema, err := schema.NewSchemaFromStruct(defaultValue)
+	if err != nil {
+		return nil, nil, err
+	}
+	arrowSchema, err := pqarrow.FromParquet(parquetSchema, nil, nil)
+	if err != nil {
+		return nil, nil, err
 	}
 	arrowFieldList := arrowSchema.Fields()
 
@@ -388,19 +412,33 @@ func writeStructsToParquetBytes[T any](values []T) ([]byte, error) {
 	valueType := reflect.TypeOf(defaultValue)
 	err = getStructFieldNameToArrowIndexMappings(valueType, "Root", arrowFieldList, nil, structFieldNameToArrowIndexMappings)
 	if err != nil {
+		return nil, nil, err
+	}
+
+	structBuilder := array.NewStructBuilder(memory.DefaultAllocator, arrow.StructOf(arrowFieldList...))
+	structBuilder.Resize(len(values) + prependNulls)
+	structBuilder.AppendNulls(prependNulls)
+
+	for _, record := range values {
+		appendGoValueToArrowBuilder(reflect.ValueOf(record), structBuilder, "Root", structFieldNameToArrowIndexMappings)
+	}
+
+	return structBuilder, arrowSchema, nil
+}
+
+// Given an array of a struct type, convert it to Parquet format
+func writeStructsToParquetBytes[T any](values []T) ([]byte, error) {
+	buf := new(bytes.Buffer)
+	structBuilder, arrowSchema, err := newStructBuilderFromStructs(values)
+	defer structBuilder.Release()
+	if err != nil {
 		return nil, err
 	}
 
-	recordBuilder := array.NewStructBuilder(memory.DefaultAllocator, arrow.StructOf(arrowFieldList...))
-	recordBuilder.Resize(len(values))
-
-	for _, record := range values {
-		appendGoValueToArrowBuilder(reflect.ValueOf(record), recordBuilder, "Root", structFieldNameToArrowIndexMappings)
-	}
-
+	arrowFieldList := arrowSchema.Fields()
 	cols := make([]arrow.Column, 0, len(arrowFieldList))
 	for idx, field := range arrowFieldList {
-		arr := recordBuilder.FieldBuilder(idx).NewArray()
+		arr := structBuilder.FieldBuilder(idx).NewArray()
 		defer arr.Release()
 		chunked := arrow.NewChunked(field.Type, []arrow.Array{arr})
 		defer chunked.Release()
@@ -408,8 +446,8 @@ func writeStructsToParquetBytes[T any](values []T) ([]byte, error) {
 		defer col.Release()
 		cols = append(cols, *col)
 	}
-
 	tbl := array.NewTable(arrowSchema, cols, int64(len(values)))
+	defer tbl.Release()
 	props := parquet.NewWriterProperties(
 		parquet.WithCompression(compress.Codecs.Snappy),
 	)
@@ -421,6 +459,8 @@ func writeStructsToParquetBytes[T any](values []T) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
+// Append a Go value to an Arrow builder
+// Recurse on nested types
 func appendGoValueToArrowBuilder(goValue reflect.Value, builder array.Builder, goNamePrefix string, goNameArrowIndexMap map[string]int) error {
 	for goValue.Kind() == reflect.Ptr {
 		if goValue.IsNil() {
@@ -589,19 +629,24 @@ func getStructFieldNameToArrowIndexMappings(goType reflect.Type, goNamePrefix st
 		skippedFields := 0
 	processGoStructField:
 		for i := 0; i < goType.NumField(); i++ {
-			var parquetName string
 			field := goType.Field(i)
 			fieldName := goNamePrefix + "." + field.Name
-
 			for _, exclude := range goNameExclude {
 				if exclude == fieldName {
 					skippedFields++
 					continue processGoStructField
 				}
 			}
+			// Default to using the field name as the parquet column name
+			parquetName := field.Name
+
+			// Look for a parquet tag for this field
 			tag := field.Tag
 			if ptags, ok := tag.Lookup("parquet"); ok {
-				if ptags != "-" {
+				if ptags == "-" {
+					// Omit
+					parquetName = ""
+				} else {
 				findNameTag:
 					for _, tag := range strings.Split(strings.Replace(ptags, "\t", "", -1), ",") {
 						tag = strings.TrimSpace(tag)
@@ -618,6 +663,7 @@ func getStructFieldNameToArrowIndexMappings(goType reflect.Type, goNamePrefix st
 						}
 					}
 				}
+
 			}
 			if len(parquetName) > 0 {
 				var arrowField arrow.Field
@@ -644,13 +690,11 @@ func getStructFieldNameToArrowIndexMappings(goType reflect.Type, goNamePrefix st
 			}
 		}
 	case reflect.Array, reflect.Slice, reflect.Map:
-		// map: incoming is entries.
 		field := goType.Elem()
 		arrowField := arrowFields[0]
 		arrowStructMemberFields := arrowFieldsFromField(arrowField)
-		// map: fields are "key", "value". value fields are "anInt", "aString"
 		if goType.Kind() == reflect.Map {
-			// We need to get the map value
+			// Get the map values. Keys aren't relevant for name indexing.
 			arrowStructMemberFields = arrowFieldsFromField(arrowStructMemberFields[1])
 		}
 		if arrowStructMemberFields != nil {
@@ -664,6 +708,7 @@ func getStructFieldNameToArrowIndexMappings(goType reflect.Type, goNamePrefix st
 	return nil
 }
 
+// For nested types, retrieve the child fields
 func arrowFieldsFromField(arrowField arrow.Field) []arrow.Field {
 	var arrowMemberFields []arrow.Field
 	switch arrowField.Type.ID() {
