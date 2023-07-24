@@ -73,8 +73,9 @@ type DeltaTable[RowType any, PartitionType any] struct {
 
 type ReadWriteTableConfiguration struct {
 	// Use an intermediate on-disk storage location to reduce memory
-	WorkingStore  storage.ObjectStore
-	WorkingFolder *storage.Path
+	WorkingStore             storage.ObjectStore
+	WorkingFolder            *storage.Path
+	ConcurrentCheckpointRead int
 }
 
 // Create a new Delta Table struct without loading any data from backing storage.
@@ -183,7 +184,7 @@ func (table *DeltaTable[RowType, PartitionType]) Create(metadata DeltaTableMetaD
 	if err != nil {
 		return err
 	}
-	table.State.merge(newState, 50000, nil)
+	table.State.merge(newState, 150000, nil)
 
 	// If either version is too high, we return an error, but we still create the table first
 	if protocol.MinReaderVersion > MAX_READER_VERSION_SUPPORTED {
@@ -455,7 +456,7 @@ func (table *DeltaTable[RowType, PartitionType]) updateIncremental(maxVersion *i
 		if err != nil {
 			return err
 		}
-		err = table.State.merge(newState, 50000, config)
+		err = table.State.merge(newState, 150000, config)
 		if err != nil {
 			return err
 		}
