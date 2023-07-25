@@ -111,105 +111,120 @@ type simpleCheckpointTestPartition struct {
 }
 
 func TestSimpleCheckpoint(t *testing.T) {
-	store, state, lock, checkpointLock := setupCheckpointTest(t, "testdata/checkpoints", false)
-	checkpointConfiguration := NewCheckpointConfiguration()
-
-	// Create a checkpoint at version 5
-	_, err := CreateCheckpoint[simpleCheckpointTestData, simpleCheckpointTestPartition](store, checkpointLock, checkpointConfiguration, 5)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// Does the checkpoint exist
-	_, err = store.Head(storage.NewPath("_delta_log/00000000000000000005.checkpoint.parquet"))
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// Does _last_checkpoint point to the checkpoint file
-	table := NewDeltaTable[simpleCheckpointTestData, simpleCheckpointTestPartition](store, lock, state)
-	checkpoints, allReturned, err := table.findLatestCheckpointsForVersion(nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(checkpoints) != 1 {
-		t.Errorf("expected %d checkpoint, found %d", 1, len(checkpoints))
-	}
-	if allReturned {
-		t.Errorf("allReturned is true but should be false since _last_checkpoint was used")
-	}
-	if len(checkpoints) > 0 {
-		lastCheckpoint := checkpoints[len(checkpoints)-1]
-		if lastCheckpoint.Version != 5 {
-			t.Errorf("last checkpoint version is %d, should be 5", lastCheckpoint.Version)
-		}
-	}
-
-	// Remove the previous log to make sure we use the checkpoint when loading
-	err = store.Delete(table.CommitUriFromVersion(4))
-	if err != nil {
-		t.Error(err)
-	}
-
-	// Checkpoint at version 10
-	_, err = CreateCheckpoint[simpleCheckpointTestData, simpleCheckpointTestPartition](store, checkpointLock, checkpointConfiguration, 10)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// Checkpoint file exists
-	checkpointMeta, err := store.Head(storage.NewPath("_delta_log/00000000000000000010.checkpoint.parquet"))
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// Does _last_checkpoint point to the checkpoint file
-	checkpoints, allReturned, err = table.findLatestCheckpointsForVersion(nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(checkpoints) != 1 {
-		t.Errorf("expected %d checkpoint, found %d", 1, len(checkpoints))
-	}
-	if allReturned {
-		t.Errorf("allReturned is true but should be false since _last_checkpoint was used")
-	}
-	if len(checkpoints) > 0 {
-		lastCheckpoint := checkpoints[len(checkpoints)-1]
-		if lastCheckpoint.Version != 10 {
-			t.Errorf("last checkpoint version is %d, should be 10", lastCheckpoint.Version)
-		}
-		if lastCheckpoint.NumOfAddFiles != 10 {
-			t.Errorf("last checkpoint number of add files is %d, should be 10", lastCheckpoint.NumOfAddFiles)
-		}
-		if lastCheckpoint.Size != 12 {
-			t.Errorf("last checkpoint number of actions is %d, should be 12", lastCheckpoint.Size)
+	for _, useOnDisk := range []bool{false, true} {
+		store, state, lock, checkpointLock := setupCheckpointTest(t, "testdata/checkpoints", false)
+		checkpointConfiguration := NewCheckpointConfiguration()
+		if useOnDisk {
+			readConfig := ReadWriteTableConfiguration{WorkingStore: store, WorkingFolder: storage.NewPath("tempCheckpoint"), ConcurrentCheckpointRead: 4}
+			defer store.Delete(storage.NewPath("tempCheckpoint"))
+			checkpointConfiguration.ReadWriteConfiguration = readConfig
 		}
 
-		if lastCheckpoint.SizeInBytes != checkpointMeta.Size {
-			t.Errorf("last checkpoint size in bytes is %d, should be %d", lastCheckpoint.SizeInBytes, checkpointMeta.Size)
+		// Create a checkpoint at version 5
+		_, err := CreateCheckpoint[simpleCheckpointTestData, simpleCheckpointTestPartition](store, checkpointLock, checkpointConfiguration, 5)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Does the checkpoint exist
+		_, err = store.Head(storage.NewPath("_delta_log/00000000000000000005.checkpoint.parquet"))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Does _last_checkpoint point to the checkpoint file
+		table := NewDeltaTable[simpleCheckpointTestData, simpleCheckpointTestPartition](store, lock, state)
+		checkpoints, allReturned, err := table.findLatestCheckpointsForVersion(nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(checkpoints) != 1 {
+			t.Errorf("expected %d checkpoint, found %d", 1, len(checkpoints))
+		}
+		if allReturned {
+			t.Errorf("allReturned is true but should be false since _last_checkpoint was used")
+		}
+		if len(checkpoints) > 0 {
+			lastCheckpoint := checkpoints[len(checkpoints)-1]
+			if lastCheckpoint.Version != 5 {
+				t.Errorf("last checkpoint version is %d, should be 5", lastCheckpoint.Version)
+			}
+		}
+
+		// Remove the previous log to make sure we use the checkpoint when loading
+		err = store.Delete(table.CommitUriFromVersion(4))
+		if err != nil {
+			t.Error(err)
+		}
+
+		// Checkpoint at version 10
+		_, err = CreateCheckpoint[simpleCheckpointTestData, simpleCheckpointTestPartition](store, checkpointLock, checkpointConfiguration, 10)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Checkpoint file exists
+		checkpointMeta, err := store.Head(storage.NewPath("_delta_log/00000000000000000010.checkpoint.parquet"))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Does _last_checkpoint point to the checkpoint file
+		checkpoints, allReturned, err = table.findLatestCheckpointsForVersion(nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(checkpoints) != 1 {
+			t.Errorf("expected %d checkpoint, found %d", 1, len(checkpoints))
+		}
+		if allReturned {
+			t.Errorf("allReturned is true but should be false since _last_checkpoint was used")
+		}
+		if len(checkpoints) > 0 {
+			lastCheckpoint := checkpoints[len(checkpoints)-1]
+			if lastCheckpoint.Version != 10 {
+				t.Errorf("last checkpoint version is %d, should be 10", lastCheckpoint.Version)
+			}
+			if lastCheckpoint.NumOfAddFiles != 10 {
+				t.Errorf("last checkpoint number of add files is %d, should be 10", lastCheckpoint.NumOfAddFiles)
+			}
+			if lastCheckpoint.Size != 12 {
+				t.Errorf("last checkpoint number of actions is %d, should be 12", lastCheckpoint.Size)
+			}
+
+			if lastCheckpoint.SizeInBytes != checkpointMeta.Size {
+				t.Errorf("last checkpoint size in bytes is %d, should be %d", lastCheckpoint.SizeInBytes, checkpointMeta.Size)
+			}
+		}
+		// Remove the previous log to make sure we use the checkpoint when loading
+		err = store.Delete(table.CommitUriFromVersion(9))
+		if err != nil {
+			t.Error(err)
+		}
+
+		// Reload table
+		table, err = OpenTableWithConfiguration[simpleCheckpointTestData, simpleCheckpointTestPartition](store, lock, state, &checkpointConfiguration.ReadWriteConfiguration)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if table.State.FileCount() != 12 {
+			t.Errorf("Found %d files, expected 12", table.State.FileCount())
+		}
+
+		// Can't create a checkpoint if it already exists
+		_, err = CreateCheckpoint[simpleCheckpointTestData, simpleCheckpointTestPartition](store, checkpointLock, checkpointConfiguration, 10)
+		if !errors.Is(err, ErrorCheckpointAlreadyExists) {
+			t.Errorf("creating a checkpoint when it already exists did not return correct error, %v", err)
 		}
 	}
-	// Remove the previous log to make sure we use the checkpoint when loading
-	err = store.Delete(table.CommitUriFromVersion(9))
-	if err != nil {
-		t.Error(err)
-	}
-
-	// Reload table
-	table, err = OpenTable[simpleCheckpointTestData, simpleCheckpointTestPartition](store, lock, state)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(table.State.Files) != 12 {
-		t.Errorf("Found %d files, expected 12", len(table.State.Files))
-	}
-
-	// Can't create a checkpoint if it already exists
-	_, err = CreateCheckpoint[simpleCheckpointTestData, simpleCheckpointTestPartition](store, checkpointLock, checkpointConfiguration, 10)
-	if !errors.Is(err, ErrorCheckpointAlreadyExists) {
-		t.Errorf("creating a checkpoint when it already exists did not return correct error, %v", err)
-	}
+	// Reload table, using on-disk optimization
+	// table, err = OpenTableWithConfiguration[simpleCheckpointTestData, simpleCheckpointTestPartition](store, lock, state, &readConfig)
+	// if err != nil {
+	// 	t.Fatal(err)
+	// }
+	// if table.State.onDiskFileCount != 12 {
+	// 	t.Errorf("Found %d files, expected 12", table.State.onDiskFileCount)
+	// }
 }
 
 type tombstonesTestData struct {

@@ -208,12 +208,10 @@ func createCheckpointWithAddType[RowType any, PartitionType any, AddType AddPart
 		return ErrorCheckpointAlreadyExists
 	}
 
-	tableState.prepareStateForCheckpoint()
+	tableState.prepareStateForCheckpoint(&checkpointConfiguration.ReadWriteConfiguration)
 
-	totalRows := len(tableState.Files) + len(tableState.Tombstones) + len(tableState.AppTransactionVersion) + 2
+	totalRows := tableState.FileCount() + tableState.TombstoneCount() + len(tableState.AppTransactionVersion) + 2
 	numParts := int32(((totalRows - 1) / checkpointConfiguration.MaxRowsPerPart) + 1)
-
-	// TODO the following comment may not apply after refactoring
 
 	// From https://github.com/delta-io/delta/blob/master/PROTOCOL.md#checkpoints:
 	// When writing multi-part checkpoints, the data must be clustered (either through hash or range partitioning)
@@ -222,13 +220,11 @@ func createCheckpointWithAddType[RowType any, PartitionType any, AddType AddPart
 	//
 	// We are not doing this, because we are using a separate checkpointing lock so only one writer can checkpoint
 	// at a time. (Note that this does not apply to external writers such as Spark.)
-	// We are however sorting all entries, so the results should still be deterministic, except for the possibility
-	// of tombstones expiring between different calls to the function.
 
 	var totalBytes int64 = 0
 	offsetRow := 0
 	for part := int32(0); part < numParts; part++ {
-		records, err := checkpointRows[RowType, PartitionType, AddType](tableState, offsetRow, checkpointConfiguration.MaxRowsPerPart)
+		records, err := checkpointRows[RowType, PartitionType, AddType](tableState, offsetRow, checkpointConfiguration)
 		if err != nil {
 			return err
 		}
@@ -256,7 +252,7 @@ func createCheckpointWithAddType[RowType any, PartitionType any, AddType AddPart
 		totalBytes += int64(len(parquetBytes))
 	}
 	if offsetRow != totalRows {
-		return ErrorCheckpointRowCountMismatch
+		return errors.Join(ErrorCheckpointRowCountMismatch, fmt.Errorf("expected %d rows, got %d rows", totalRows, offsetRow))
 	}
 
 	var reportedParts *int32
@@ -284,6 +280,8 @@ func createCheckpointWithAddType[RowType any, PartitionType any, AddType AddPart
 }
 
 // / Generate an Add action for a checkpoint (with additional fields) from a basic Add action
+// / Note that parsed stats and partition have been removed during the parquet library change.
+// / TODO add them back
 func checkpointAdd[RowType any, PartitionType any, AddType AddPartitioned[RowType, PartitionType] | Add[RowType]](add *AddPartitioned[RowType, PartitionType]) (*AddType, error) {
 	// stats, err := StatsFromJson([]byte(add.Stats))
 	// if err != nil {

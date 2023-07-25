@@ -184,7 +184,7 @@ func (table *DeltaTable[RowType, PartitionType]) Create(metadata DeltaTableMetaD
 	if err != nil {
 		return err
 	}
-	table.State.merge(newState, 150000, nil)
+	table.State.merge(newState, 150000, nil, false)
 
 	// If either version is too high, we return an error, but we still create the table first
 	if protocol.MinReaderVersion > MAX_READER_VERSION_SUPPORTED {
@@ -442,7 +442,7 @@ func (table *DeltaTable[RowType, PartitionType]) restoreCheckpoint(checkpoint *C
 func (table *DeltaTable[RowType, PartitionType]) updateIncremental(maxVersion *int64, config *ReadWriteTableConfiguration) error {
 	for {
 		if maxVersion != nil && table.State.Version == *maxVersion {
-			return nil
+			break
 		}
 
 		nextCommitVersion, nextCommitActions, noMoreCommits, err := table.nextCommitDetails()
@@ -456,7 +456,8 @@ func (table *DeltaTable[RowType, PartitionType]) updateIncremental(maxVersion *i
 		if err != nil {
 			return err
 		}
-		err = table.State.merge(newState, 150000, config)
+		// TODO configuration option for max rows per part
+		err = table.State.merge(newState, 150000, config, false)
 		if err != nil {
 			return err
 		}
@@ -464,6 +465,13 @@ func (table *DeltaTable[RowType, PartitionType]) updateIncremental(maxVersion *i
 
 	if table.State.Version == -1 {
 		return ErrorInvalidVersion
+	}
+	if table.State.onDiskOptimization {
+		// We need to do one final "merge" to resolve any remaining adds/removes in our buffer
+		err := table.State.merge(nil, 150000, config, true)
+		if err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -496,7 +504,7 @@ func (table *DeltaTable[RowType, PartitionType]) CreateCheckpoint(checkpointLock
 // / If the lock cannot be obtained, does not retry - if other processes are checkpointing there's no need to duplicate the effort
 func CreateCheckpoint[RowType any, PartitionType any](store storage.ObjectStore, checkpointLock lock.Locker, checkpointConfiguration *CheckpointConfiguration, version int64) (checkpointed bool, err error) {
 	// The table doesn't need a commit lock or state store as we are not going to perform any commits
-	table, err := OpenTableWithVersion[RowType, PartitionType](store, nil, nil, version)
+	table, err := OpenTableWithVersionAndConfiguration[RowType, PartitionType](store, nil, nil, version, &checkpointConfiguration.ReadWriteConfiguration)
 	if err != nil {
 		// If the UnsafeIgnoreUnsupportedReaderWriterVersionErrors option is true, we can ignore unsupported version errors
 		isUnsupportedVersionError := errors.Is(err, ErrorUnsupportedReaderVersion) || errors.Is(err, ErrorUnsupportedWriterVersion)

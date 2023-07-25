@@ -41,7 +41,7 @@ var (
 // Read helpers
 
 // Given an array of go structs (as reflect values), and an array of corresponding arrow Arrays, set the go struct values recursively
-func goStructFromArrowArrays(goStructs []reflect.Value, arrowArrays []arrow.Array, goNamePrefix string, goNameArrowIndexMap map[string]int) error {
+func goStructFromArrowArrays(goStructs []reflect.Value, arrowArrays []arrow.Array, goNamePrefix string, goNameArrowIndexMap map[string]int, rowOffset int) error {
 	goType := goStructs[0].Type()
 	for goType.Kind() == reflect.Pointer {
 		goType = goType.Elem()
@@ -49,6 +49,7 @@ func goStructFromArrowArrays(goStructs []reflect.Value, arrowArrays []arrow.Arra
 
 	for row := 0; row < len(goStructs); row++ {
 		structElem := goStructs[row]
+		arrowRow := row + rowOffset
 		for structElem.Kind() == reflect.Pointer {
 			structElem = structElem.Elem()
 		}
@@ -62,12 +63,12 @@ func goStructFromArrowArrays(goStructs []reflect.Value, arrowArrays []arrow.Arra
 			arrowIndex, ok := goNameArrowIndexMap[goFieldName]
 			if ok {
 				arrowField := arrowArrays[arrowIndex]
-				if arrowField.IsNull(row) {
+				if arrowField.IsNull(arrowRow) {
 					continue
 				}
 				goField := structElem.FieldByName(goType.Field(i).Name)
 				elem := traversePointersAndGetValue(goField, false)
-				err := goValueFromArrowArray(elem, arrowField, row, goFieldName, goNameArrowIndexMap)
+				err := goValueFromArrowArray(elem, arrowField, arrowRow, goFieldName, goNameArrowIndexMap)
 				if err != nil {
 					return err
 				}
@@ -312,8 +313,7 @@ func readAndProcessStructsFromParquet[T any](parquetBytes []byte, process func(*
 	// during record assignments
 	structFieldNameToArrowIndexMappings := make(map[string]int, 100)
 	defaultType := reflect.TypeOf(defaultValue)
-	exclude := []string{"Root.Add", "Root.Remove"}
-	err = getStructFieldNameToArrowIndexMappings(defaultType, "Root", arrowFieldList, exclude, structFieldNameToArrowIndexMappings)
+	err = getStructFieldNameToArrowIndexMappings(defaultType, "Root", arrowFieldList, []string{}, structFieldNameToArrowIndexMappings)
 	if err != nil {
 		return err
 	}
@@ -350,7 +350,7 @@ func readAndProcessStructsFromParquet[T any](parquetBytes []byte, process func(*
 				entryValues[j] = reflect.ValueOf(t)
 			}
 
-			goStructFromArrowArrays(entryValues, record.Columns(), "Root", structFieldNameToArrowIndexMappings)
+			goStructFromArrowArrays(entryValues, record.Columns(), "Root", structFieldNameToArrowIndexMappings, 0)
 			for j := int64(0); j < record.NumRows(); j++ {
 				err = process(entries[j])
 				if err != nil {
