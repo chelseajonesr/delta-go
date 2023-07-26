@@ -191,7 +191,7 @@ func (tableState *DeltaTableState[RowType, PartitionType]) processAction(actionI
 }
 
 // / Merges new state information into our state
-func (tableState *DeltaTableState[RowType, PartitionType]) merge(newTableState *DeltaTableState[RowType, PartitionType], maxRowsPerPart int, config *ReadWriteTableConfiguration, finalMerge bool) error {
+func (tableState *DeltaTableState[RowType, PartitionType]) merge(newTableState *DeltaTableState[RowType, PartitionType], maxRowsPerPart int, config *ReadWriteCheckpointConfiguration, finalMerge bool) error {
 	var err error
 
 	if tableState.onDiskOptimization {
@@ -244,7 +244,7 @@ func (tableState *DeltaTableState[RowType, PartitionType]) merge(newTableState *
 	return nil
 }
 
-func stateFromCheckpoint[RowType any, PartitionType any](table *DeltaTable[RowType, PartitionType], checkpoint *CheckPoint, config *ReadWriteTableConfiguration) (*DeltaTableState[RowType, PartitionType], error) {
+func stateFromCheckpoint[RowType any, PartitionType any](table *DeltaTable[RowType, PartitionType], checkpoint *CheckPoint, config *ReadWriteCheckpointConfiguration) (*DeltaTableState[RowType, PartitionType], error) {
 	newState := NewDeltaTableState[RowType, PartitionType](checkpoint.Version)
 	checkpointDataPaths := table.GetCheckpointDataPaths(checkpoint)
 	if config != nil && config.WorkingStore != nil {
@@ -276,7 +276,7 @@ type checkpointProcessingTask[RowType any, PartitionType any] struct {
 	location storage.Path
 	state    *DeltaTableState[RowType, PartitionType]
 	part     int
-	config   *ReadWriteTableConfiguration
+	config   *ReadWriteCheckpointConfiguration
 	store    storage.ObjectStore
 }
 
@@ -302,7 +302,7 @@ func isPartitionTypeEmpty[PartitionType any]() bool {
 	return structType.NumField() == 0
 }
 
-func (tableState *DeltaTableState[RowType, PartitionType]) processCheckpointBytes(checkpointBytes []byte, part int, config *ReadWriteTableConfiguration) (returnErr error) {
+func (tableState *DeltaTableState[RowType, PartitionType]) processCheckpointBytes(checkpointBytes []byte, part int, config *ReadWriteCheckpointConfiguration) (returnErr error) {
 	// Determine whether partitioned
 	isPartitioned := !isPartitionTypeEmpty[PartitionType]()
 	if isPartitioned {
@@ -313,7 +313,7 @@ func (tableState *DeltaTableState[RowType, PartitionType]) processCheckpointByte
 }
 
 // / Update a table state with the contents of a checkpoint file
-func processCheckpointBytesWithAddSpecified[RowType any, PartitionType any, AddType AddPartitioned[RowType, PartitionType] | Add[RowType]](checkpointBytes []byte, tableState *DeltaTableState[RowType, PartitionType], part int, config *ReadWriteTableConfiguration) error {
+func processCheckpointBytesWithAddSpecified[RowType any, PartitionType any, AddType AddPartitioned[RowType, PartitionType] | Add[RowType]](checkpointBytes []byte, tableState *DeltaTableState[RowType, PartitionType], part int, config *ReadWriteCheckpointConfiguration) error {
 	concurrentCheckpointRead := tableState.onDiskOptimization && config.ConcurrentCheckpointRead > 1
 	var processFunc = func(checkpointEntry *CheckpointEntry[RowType, PartitionType, AddType]) error {
 		var action Action
@@ -446,7 +446,7 @@ func processCheckpointBytesWithAddSpecified[RowType any, PartitionType any, AddT
 }
 
 // / Prepare the table state for checkpointing by updating tombstones
-func (tableState *DeltaTableState[RowType, PartitionType]) prepareStateForCheckpoint(config *ReadWriteTableConfiguration) error {
+func (tableState *DeltaTableState[RowType, PartitionType]) prepareStateForCheckpoint(config *ReadWriteCheckpointConfiguration) error {
 	if tableState.CurrentMetadata == nil {
 		return ErrorMissingMetadata
 	}
@@ -465,17 +465,16 @@ func (tableState *DeltaTableState[RowType, PartitionType]) prepareStateForCheckp
 	for path, remove := range tableState.Tombstones {
 		if remove.DeletionTimestamp == nil || *remove.DeletionTimestamp > retentionTimestamp {
 			unexpiredTombstones[path] = remove
-			doNotUseExtendedFileMetadata = doNotUseExtendedFileMetadata && (remove.ExtendedFileMetadata == nil || !*remove.ExtendedFileMetadata)
+			doNotUseExtendedFileMetadata = doNotUseExtendedFileMetadata && !remove.ExtendedFileMetadata
 		}
 	}
 
 	tableState.Tombstones = unexpiredTombstones
 
 	// If any Remove has ExtendedFileMetadata = false, set all to false
-	removeExtendedFileMetadata := false
 	if doNotUseExtendedFileMetadata {
 		for path, remove := range tableState.Tombstones {
-			remove.ExtendedFileMetadata = &removeExtendedFileMetadata
+			remove.ExtendedFileMetadata = false
 			tableState.Tombstones[path] = remove
 			// TODO - do we need to remove the extra settings if it was true?
 		}

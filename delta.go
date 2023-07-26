@@ -71,11 +71,12 @@ type DeltaTable[RowType any, PartitionType any] struct {
 	VersionTimestamp map[int64]time.Time
 }
 
-type ReadWriteTableConfiguration struct {
+type ReadWriteCheckpointConfiguration struct {
 	// Use an intermediate on-disk storage location to reduce memory
-	WorkingStore             storage.ObjectStore
-	WorkingFolder            *storage.Path
-	ConcurrentCheckpointRead int
+	WorkingStore              storage.ObjectStore
+	WorkingFolder             *storage.Path
+	ConcurrentCheckpointRead  int
+	ConcurrentCheckpointWrite int
 }
 
 // Create a new Delta Table struct without loading any data from backing storage.
@@ -243,8 +244,8 @@ func (table *DeltaTable[RowType, PartitionType]) ReadCommitVersion(version int64
 }
 
 // / Load the table state at the latest version
-func (table *DeltaTable[RowType, PartitionType]) Load() error {
-	return table.LoadVersionWithConfiguration(nil, nil)
+func (table *DeltaTable[RowType, PartitionType]) Load(config *ReadWriteCheckpointConfiguration) error {
+	return table.LoadVersionWithConfiguration(nil, config)
 }
 
 // / Load the table state at the specified version
@@ -252,8 +253,8 @@ func (table *DeltaTable[RowType, PartitionType]) LoadVersion(version *int64) err
 	return table.LoadVersionWithConfiguration(version, nil)
 }
 
-// / Load the table state at the specified version
-func (table *DeltaTable[RowType, PartitionType]) LoadVersionWithConfiguration(version *int64, config *ReadWriteTableConfiguration) error {
+// / Load the table state at the specified version using the given configuration
+func (table *DeltaTable[RowType, PartitionType]) LoadVersionWithConfiguration(version *int64, config *ReadWriteCheckpointConfiguration) error {
 	table.LastCheckPoint = nil
 	table.State = *NewDeltaTableState[RowType, PartitionType](-1)
 
@@ -427,7 +428,7 @@ func (table *DeltaTable[RowType, PartitionType]) GetCheckpointDataPaths(checkpoi
 }
 
 // / Update the table state from the given checkpoint
-func (table *DeltaTable[RowType, PartitionType]) restoreCheckpoint(checkpoint *CheckPoint, config *ReadWriteTableConfiguration) error {
+func (table *DeltaTable[RowType, PartitionType]) restoreCheckpoint(checkpoint *CheckPoint, config *ReadWriteCheckpointConfiguration) error {
 	state, err := stateFromCheckpoint(table, checkpoint, config)
 	if err != nil {
 		return err
@@ -439,7 +440,7 @@ func (table *DeltaTable[RowType, PartitionType]) restoreCheckpoint(checkpoint *C
 // / Updates the DeltaTable to the latest version by incrementally applying newer versions.
 // / It assumes that the table is already updated to the current version `self.version`.
 // / This function does not look for checkpoints
-func (table *DeltaTable[RowType, PartitionType]) updateIncremental(maxVersion *int64, config *ReadWriteTableConfiguration) error {
+func (table *DeltaTable[RowType, PartitionType]) updateIncremental(maxVersion *int64, config *ReadWriteCheckpointConfiguration) error {
 	for {
 		if maxVersion != nil && table.State.Version == *maxVersion {
 			break
@@ -889,7 +890,7 @@ func NewDeltaTransactionOptions() *DeltaTransactionOptions {
 func OpenTableWithVersion[RowType any, PartitionType any](store storage.ObjectStore, lock lock.Locker, stateStore state.StateStore, version int64) (*DeltaTable[RowType, PartitionType], error) {
 	return OpenTableWithVersionAndConfiguration[RowType, PartitionType](store, lock, stateStore, version, nil)
 }
-func OpenTableWithVersionAndConfiguration[RowType any, PartitionType any](store storage.ObjectStore, lock lock.Locker, stateStore state.StateStore, version int64, config *ReadWriteTableConfiguration) (*DeltaTable[RowType, PartitionType], error) {
+func OpenTableWithVersionAndConfiguration[RowType any, PartitionType any](store storage.ObjectStore, lock lock.Locker, stateStore state.StateStore, version int64, config *ReadWriteCheckpointConfiguration) (*DeltaTable[RowType, PartitionType], error) {
 	table := NewDeltaTable[RowType, PartitionType](store, lock, stateStore)
 	err := table.LoadVersionWithConfiguration(&version, config)
 	if err != nil {
@@ -912,7 +913,7 @@ func OpenTableWithVersionAndConfiguration[RowType any, PartitionType any](store 
 func OpenTable[RowType any, PartitionType any](store storage.ObjectStore, lock lock.Locker, stateStore state.StateStore) (*DeltaTable[RowType, PartitionType], error) {
 	return OpenTableWithConfiguration[RowType, PartitionType](store, lock, stateStore, nil)
 }
-func OpenTableWithConfiguration[RowType any, PartitionType any](store storage.ObjectStore, lock lock.Locker, stateStore state.StateStore, config *ReadWriteTableConfiguration) (*DeltaTable[RowType, PartitionType], error) {
+func OpenTableWithConfiguration[RowType any, PartitionType any](store storage.ObjectStore, lock lock.Locker, stateStore state.StateStore, config *ReadWriteCheckpointConfiguration) (*DeltaTable[RowType, PartitionType], error) {
 	table := NewDeltaTable[RowType, PartitionType](store, lock, stateStore)
 	err := table.LoadVersionWithConfiguration(nil, config)
 	if err != nil {

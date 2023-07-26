@@ -16,6 +16,7 @@ require (
 	github.com/sirupsen/logrus v1.9.0
 	github.com/stvp/tempredis v0.0.0-20181119212430-b82af8480203
 	golang.org/x/exp v0.0.0-20230224173230-c95f2b4c22f2
+	golang.org/x/sync v0.1.0
 )
 
 require (
@@ -43,7 +44,6 @@ require (
 	github.com/zeebo/xxh3 v1.0.2 // indirect
 	golang.org/x/mod v0.8.0 // indirect
 	golang.org/x/net v0.7.0 // indirect
-	golang.org/x/sync v0.1.0 // indirect
 	golang.org/x/text v0.7.0 // indirect
 	golang.org/x/tools v0.6.0 // indirect
 	golang.org/x/xerrors v0.0.0-20220907171357-04be3eba64a2 // indirect

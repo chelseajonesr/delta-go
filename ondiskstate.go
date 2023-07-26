@@ -48,6 +48,112 @@ type OnDiskTableState struct {
 	onDiskRemoveExtendedFileMetadata bool
 }
 
+// Merge the incoming state with existing on-disk state
+func (tableState *DeltaTableState[RowType, PartitionType]) mergeOnDiskState(newTableState *DeltaTableState[RowType, PartitionType], maxRowsPerPart int, config *ReadWriteCheckpointConfiguration, finalMerge bool) error {
+	// Try to batch file updates before applying them to the on-disk files as that process can be slow
+	// If we have incoming adds and existing removes, or vice versa, or if we have too many pending updates, then process the pending updates
+	if finalMerge ||
+		(len(tableState.Files) > 0 && len(newTableState.Tombstones) > 0) ||
+		(len(tableState.Tombstones) > 0 && len(newTableState.Files) > 0) ||
+		(len(tableState.Files)+len(tableState.Tombstones) > maxRowsPerPart) {
+		appended := false
+
+		mergeSinglePart := func(part int) error {
+			tryAppend := part == len(tableState.onDiskTempFiles)-1
+			didAppend, addsDiff, tombstonesDiff, err := mergeNewAddsAndRemovesToOnDiskPartState(config.WorkingStore, &tableState.onDiskTempFiles[part], tableState.Files, tableState.Tombstones, maxRowsPerPart, tryAppend)
+			if err != nil {
+				return err
+			}
+			// Only one call to updateOnDiskState() will try to append, so only one (at most) goroutine will set appended here
+			if didAppend {
+				appended = true
+			}
+			// This is threadsafe
+			if addsDiff != 0 || tombstonesDiff != 0 {
+				tableState.updateOnDiskCounts(addsDiff, tombstonesDiff)
+			}
+			return nil
+		}
+		// Optional concurrency support
+		if config.ConcurrentCheckpointRead > 1 {
+			g, ctx := errgroup.WithContext(context.Background())
+			fileIndexChannel := make(chan int)
+
+			for i := 0; i < config.ConcurrentCheckpointRead; i++ {
+				g.Go(func() error {
+					for part := range fileIndexChannel {
+						err := mergeSinglePart(part)
+						if err != nil {
+							return err
+						}
+					}
+					return nil
+				})
+			}
+			g.Go(func() error {
+				defer close(fileIndexChannel)
+				done := ctx.Done()
+				for i := range tableState.onDiskTempFiles {
+					if err := ctx.Err(); err != nil {
+						return err
+					}
+					select {
+					case fileIndexChannel <- i:
+						continue
+					case <-done:
+						break
+					}
+				}
+				return ctx.Err()
+			})
+			err := g.Wait()
+			if err != nil {
+				return err
+			}
+		} else {
+			// non-concurrent
+			for part := range tableState.onDiskTempFiles {
+				err := mergeSinglePart(part)
+				if err != nil {
+					return err
+				}
+			}
+		}
+
+		if !appended {
+			// Didn't append so create a new file instead
+			exampleRecord, err := newCheckpointEntryRecord[RowType, PartitionType](0)
+			if err != nil {
+				return err
+			}
+			schemaDetails := new(tempFileSchemaDetails)
+			err = schemaDetails.setFromArrowSchema(exampleRecord.Schema(), nil)
+			if err != nil {
+				return err
+			}
+			newRecord, err := newRecordForAddsAndRemoves(tableState.Files, tableState.Tombstones, schemaDetails.addFieldIndex, schemaDetails.removeFieldIndex)
+			if err != nil {
+				return err
+			}
+			defer newRecord.Release()
+			(*schemaDetails).schema = newRecord.Schema()
+
+			onDiskFile := storage.PathFromIter([]string{config.WorkingFolder.Raw, fmt.Sprintf("intermediate.%d.parquet", len(tableState.onDiskTempFiles))})
+			err = writeRecords(config.WorkingStore, &onDiskFile, schemaDetails.schema, []arrow.Record{newRecord})
+			if err != nil {
+				return err
+			}
+			tableState.onDiskTempFiles = append(tableState.onDiskTempFiles, onDiskFile)
+			tableState.updateOnDiskCounts(len(tableState.Files), len(tableState.Tombstones))
+		}
+		// Reset the pending files and tombstones
+		tableState.Files = make(map[string]AddPartitioned[RowType, PartitionType], 10000)
+		tableState.Tombstones = make(map[string]Remove, 10000)
+	}
+	return nil
+}
+
+// Merge new adds and removes with a single on-disk temp file
 func mergeNewAddsAndRemovesToOnDiskPartState[RowType any, PartitionType any](
 	store storage.ObjectStore, path *storage.Path,
 	newAdds map[string]AddPartitioned[RowType, PartitionType], newRemoves map[string]Remove,
@@ -55,7 +161,7 @@ func mergeNewAddsAndRemovesToOnDiskPartState[RowType any, PartitionType any](
 	var addDiffCount, tombstoneDiffCount int
 	appended := false
 
-	getRowsToNull := func(record arrow.Record, arrowSchemaDetails *tempFileSchemaDetails, addRowsToNull []int64, removeRowsToNull []int64) {
+	getRowsToNull := func(record arrow.Record, arrowSchemaDetails *tempFileSchemaDetails, addRowsToNull *[]int64, removeRowsToNull *[]int64) {
 		addPathArray := record.Column(arrowSchemaDetails.addFieldIndex).(*array.Struct).Field(arrowSchemaDetails.addPathFieldIndex).(*array.String)
 		removePathArray := record.Column(arrowSchemaDetails.removeFieldIndex).(*array.Struct).Field(arrowSchemaDetails.removePathFieldIndex).(*array.String)
 		// Note that although record.NumRows() returns an int64, both the IsNull() and Value() functions accept ints
@@ -65,7 +171,7 @@ func mergeNewAddsAndRemovesToOnDiskPartState[RowType any, PartitionType any](
 				// If the file is now in tombstones, it needs to be removed from the add file list
 				_, ok := newRemoves[addPathArray.Value(row)]
 				if ok {
-					addRowsToNull = append(addRowsToNull, int64(row))
+					*addRowsToNull = append(*addRowsToNull, int64(row))
 				}
 			}
 			// Is there a remove action in this row
@@ -73,12 +179,12 @@ func mergeNewAddsAndRemovesToOnDiskPartState[RowType any, PartitionType any](
 				// If the file has been re-added, it needs to be removed from the tombstones
 				_, ok := newAdds[removePathArray.Value(row)]
 				if ok {
-					removeRowsToNull = append(removeRowsToNull, int64(row))
+					*removeRowsToNull = append(*removeRowsToNull, int64(row))
 				}
 			}
 		}
-		addDiffCount -= len(addRowsToNull)
-		tombstoneDiffCount -= len(removeRowsToNull)
+		addDiffCount -= len(*addRowsToNull)
+		tombstoneDiffCount -= len(*removeRowsToNull)
 	}
 
 	appendRows := func(records *[]arrow.Record, arrowSchemaDetails *tempFileSchemaDetails, rowCount int) (bool, error) {
@@ -113,7 +219,7 @@ func mergeNewAddsAndRemovesToOnDiskPartState[RowType any, PartitionType any](
 // This may be called concurrently on multiple checkpoint parts
 func updateOnDiskPartState[RowType any, PartitionType any](
 	store storage.ObjectStore, path *storage.Path,
-	getRowsToNull func(record arrow.Record, arrowSchemaDetails *tempFileSchemaDetails, addRowsToNull []int64, removeRowsToNull []int64),
+	getRowsToNull func(record arrow.Record, arrowSchemaDetails *tempFileSchemaDetails, addRowsToNull *[]int64, removeRowsToNull *[]int64),
 	appendRows func(records *[]arrow.Record, arrowSchemaDetails *tempFileSchemaDetails, rowCount int) (bool, error)) error {
 
 	changed := false
@@ -137,7 +243,7 @@ func updateOnDiskPartState[RowType any, PartitionType any](
 		// Locate changes to the add and remove columns
 		addRowsToNull := make([]int64, 0, rowCount)
 		removeRowsToNull := make([]int64, 0, rowCount)
-		getRowsToNull(record, arrowSchemaDetails, addRowsToNull, removeRowsToNull)
+		getRowsToNull(record, arrowSchemaDetails, &addRowsToNull, &removeRowsToNull)
 
 		// Copy the add and remove columns, including children, nulling the changed rows as we go
 		var changedAdd arrow.Array
@@ -188,112 +294,8 @@ func updateOnDiskPartState[RowType any, PartitionType any](
 	return nil
 }
 
-// Merge the incoming state with existing on-disk state
-func (tableState *DeltaTableState[RowType, PartitionType]) mergeOnDiskState(newTableState *DeltaTableState[RowType, PartitionType], maxRowsPerPart int, config *ReadWriteTableConfiguration, finalMerge bool) error {
-	var err error
-	// Try to batch file updates before applying them to the on-disk files as that process can be slow
-	// If we have incoming adds and existing removes, or vice versa, or if we have too many pending updates, then process the pending updates
-	if finalMerge ||
-		(len(tableState.Files) > 0 && len(newTableState.Tombstones) > 0) ||
-		(len(tableState.Tombstones) > 0 && len(newTableState.Files) > 0) ||
-		(len(tableState.Files)+len(tableState.Tombstones) > maxRowsPerPart) {
-		appended := false
-		// Optional concurrency support
-		if config.ConcurrentCheckpointRead > 1 {
-			g, ctx := errgroup.WithContext(context.Background())
-			fileIndexChannel := make(chan int)
-
-			for i := 0; i < config.ConcurrentCheckpointRead; i++ {
-				g.Go(func() error {
-					for idx := range fileIndexChannel {
-						tryAppend := idx == len(tableState.onDiskTempFiles)-1
-						didAppend, addsDiff, tombstonesDiff, err := mergeNewAddsAndRemovesToOnDiskPartState(config.WorkingStore, &tableState.onDiskTempFiles[idx], tableState.Files, tableState.Tombstones, maxRowsPerPart, tryAppend)
-						if err != nil {
-							return err
-						}
-						// Only one call to updateOnDiskState() will try to append, so only one (at most) goroutine will set appended here
-						if didAppend {
-							appended = true
-						}
-						// This is threadsafe
-						if addsDiff != 0 || tombstonesDiff != 0 {
-							tableState.updateOnDiskCounts(addsDiff, tombstonesDiff)
-						}
-					}
-					return nil
-				})
-			}
-			g.Go(func() error {
-				defer close(fileIndexChannel)
-				done := ctx.Done()
-				for i := range tableState.onDiskTempFiles {
-					if err := ctx.Err(); err != nil {
-						return err
-					}
-					select {
-					case fileIndexChannel <- i:
-						continue
-					case <-done:
-						break
-					}
-				}
-				return ctx.Err()
-			})
-			err := g.Wait()
-			if err != nil {
-				return err
-			}
-		} else {
-			// non-concurrent
-			for i, f := range tableState.onDiskTempFiles {
-				// Try to append if it's the last file
-				tryAppend := i == len(tableState.onDiskTempFiles)-1
-				var addsDiff, tombstonesDiff int
-				appended, addsDiff, tombstonesDiff, err = mergeNewAddsAndRemovesToOnDiskPartState(config.WorkingStore, &f, tableState.Files, tableState.Tombstones, maxRowsPerPart, tryAppend)
-				if err != nil {
-					return err
-				}
-				if addsDiff != 0 || tombstonesDiff != 0 {
-					tableState.updateOnDiskCounts(addsDiff, tombstonesDiff)
-				}
-			}
-		}
-
-		if !appended {
-			// Didn't append so create a new file instead
-			exampleRecord, err := newCheckpointEntryRecord[RowType, PartitionType](0)
-			if err != nil {
-				return err
-			}
-			schemaDetails := new(tempFileSchemaDetails)
-			err = schemaDetails.setFromArrowSchema(exampleRecord.Schema(), nil)
-			if err != nil {
-				return err
-			}
-			newRecord, err := newRecordForAddsAndRemoves(tableState.Files, tableState.Tombstones, schemaDetails.addFieldIndex, schemaDetails.removeFieldIndex)
-			if err != nil {
-				return err
-			}
-			defer newRecord.Release()
-			(*schemaDetails).schema = newRecord.Schema()
-
-			onDiskFile := storage.PathFromIter([]string{config.WorkingFolder.Raw, fmt.Sprintf("intermediate.%d.parquet", len(tableState.onDiskTempFiles))})
-			err = writeRecords(config.WorkingStore, &onDiskFile, schemaDetails.schema, []arrow.Record{newRecord})
-			if err != nil {
-				return err
-			}
-			tableState.onDiskTempFiles = append(tableState.onDiskTempFiles, onDiskFile)
-			tableState.updateOnDiskCounts(len(tableState.Files), len(tableState.Tombstones))
-		}
-		// Reset the pending files and tombstones
-		tableState.Files = make(map[string]AddPartitioned[RowType, PartitionType], 10000)
-		tableState.Tombstones = make(map[string]Remove, 10000)
-	}
-	return nil
-}
-
 // Count the adds and tombstones in a checkpoint file and add them to the state total
-func countAddsAndTombstones[RowType any, PartitionType any](tableState *DeltaTableState[RowType, PartitionType], checkpointBytes []byte, arrowSchema *arrow.Schema, config *ReadWriteTableConfiguration) error {
+func countAddsAndTombstones[RowType any, PartitionType any](tableState *DeltaTableState[RowType, PartitionType], checkpointBytes []byte, arrowSchema *arrow.Schema, config *ReadWriteCheckpointConfiguration) error {
 	arrowSchemaDetails := new(tempFileSchemaDetails)
 	err := arrowSchemaDetails.setFromArrowSchema(arrowSchema, nil)
 	if err != nil {
@@ -504,7 +506,7 @@ func copyArrowArrayWithNulls(in arrow.Array, nullRows []int64) (arrow.Array, err
 }
 
 // Apply checkpoint parts to the table state concurrently
-func (tableState *DeltaTableState[RowType, PartitionType]) applyCheckpointConcurrently(store storage.ObjectStore, checkpointDataPaths []storage.Path, config *ReadWriteTableConfiguration) error {
+func (tableState *DeltaTableState[RowType, PartitionType]) applyCheckpointConcurrently(store storage.ObjectStore, checkpointDataPaths []storage.Path, config *ReadWriteCheckpointConfiguration) error {
 	var taskChannel chan checkpointProcessingTask[RowType, PartitionType]
 	g, ctx := errgroup.WithContext(context.Background())
 	taskChannel = make(chan checkpointProcessingTask[RowType, PartitionType])
@@ -562,9 +564,27 @@ func (tableState *DeltaTableState[RowType, PartitionType]) setTombstoneWithoutEx
 
 // Find out whether there are any non-extended metadata tombstones and null out any expired tombstones
 // Also count adds and removes in each on disk temp file
-func (tableState *DeltaTableState[RowType, PartitionType]) prepareOnDiskStateForCheckpoint(retentionTimestamp int64, config *ReadWriteTableConfiguration) error {
+func (tableState *DeltaTableState[RowType, PartitionType]) prepareOnDiskStateForCheckpoint(retentionTimestamp int64, config *ReadWriteCheckpointConfiguration) error {
 	tableState.onDiskFileCountsPerPart = make([]int, len(tableState.onDiskTempFiles))
 	tableState.onDiskTombstoneCountsPerPart = make([]int, len(tableState.onDiskTempFiles))
+
+	prepareSinglePart := func(part int) error {
+		tombstoneWithoutExtendedMetadata, tombstonesDiff, partFileCount, partTombstoneCount, err := prepareOnDiskPartStateForCheckpoint[RowType, PartitionType](config.WorkingStore, &tableState.onDiskTempFiles[part], retentionTimestamp)
+		if err != nil {
+			return err
+		}
+		tableState.onDiskFileCountsPerPart[part] = partFileCount
+		tableState.onDiskTombstoneCountsPerPart[part] = partTombstoneCount
+
+		// These updates are threadsafe
+		if tombstoneWithoutExtendedMetadata {
+			tableState.setTombstoneWithoutExtendedMetadata()
+		}
+		if tombstonesDiff != 0 {
+			tableState.updateOnDiskCounts(0, tombstonesDiff)
+		}
+		return nil
+	}
 
 	// Optional concurrency support
 	if config.ConcurrentCheckpointRead > 1 {
@@ -574,19 +594,9 @@ func (tableState *DeltaTableState[RowType, PartitionType]) prepareOnDiskStateFor
 		for i := 0; i < config.ConcurrentCheckpointRead; i++ {
 			g.Go(func() error {
 				for part := range fileIndexChannel {
-					tombstoneWithoutExtendedMetadata, tombstonesDiff, partFileCount, partTombstoneCount, err := prepareOnDiskPartStateForCheckpoint[RowType, PartitionType](config.WorkingStore, &tableState.onDiskTempFiles[part], retentionTimestamp)
+					err := prepareSinglePart(part)
 					if err != nil {
 						return err
-					}
-					tableState.onDiskFileCountsPerPart[part] = partFileCount
-					tableState.onDiskTombstoneCountsPerPart[part] = partTombstoneCount
-
-					// These updates are threadsafe
-					if tombstoneWithoutExtendedMetadata {
-						tableState.setTombstoneWithoutExtendedMetadata()
-					}
-					if tombstonesDiff != 0 {
-						tableState.updateOnDiskCounts(0, tombstonesDiff)
 					}
 				}
 				return nil
@@ -614,19 +624,10 @@ func (tableState *DeltaTableState[RowType, PartitionType]) prepareOnDiskStateFor
 		}
 	} else {
 		// non-concurrent
-		for part, f := range tableState.onDiskTempFiles {
-			// Try to append if it's the last file
-			tombstoneWithoutExtendedMetadata, tombstonesDiff, partFileCount, partTombstoneCount, err := prepareOnDiskPartStateForCheckpoint[RowType, PartitionType](config.WorkingStore, &f, retentionTimestamp)
+		for part := range tableState.onDiskTempFiles {
+			err := prepareSinglePart(part)
 			if err != nil {
 				return err
-			}
-			tableState.onDiskFileCountsPerPart[part] = partFileCount
-			tableState.onDiskTombstoneCountsPerPart[part] = partTombstoneCount
-			if tombstoneWithoutExtendedMetadata {
-				tableState.setTombstoneWithoutExtendedMetadata()
-			}
-			if tombstonesDiff != 0 {
-				tableState.updateOnDiskCounts(0, tombstonesDiff)
 			}
 		}
 	}
@@ -640,7 +641,7 @@ func prepareOnDiskPartStateForCheckpoint[RowType any, PartitionType any](store s
 	tombstoneWithoutExtendedMetadata := false
 	tombstoneCount := 0
 	fileCount := 0
-	getRowsToNull := func(record arrow.Record, arrowSchemaDetails *tempFileSchemaDetails, addRowsToNull []int64, removeRowsToNull []int64) {
+	getRowsToNull := func(record arrow.Record, arrowSchemaDetails *tempFileSchemaDetails, addRowsToNull *[]int64, removeRowsToNull *[]int64) {
 		removeArray := record.Column(arrowSchemaDetails.removeFieldIndex).(*array.Struct)
 		addArray := record.Column(arrowSchemaDetails.addFieldIndex).(*array.Struct)
 		removeExtendedFileMetadataArray := removeArray.Field(arrowSchemaDetails.removeExtendedFileMetadataIndex).(*array.Boolean)
@@ -653,14 +654,14 @@ func prepareOnDiskPartStateForCheckpoint[RowType any, PartitionType any](store s
 				tombstoneWithoutExtendedMetadata = tombstoneWithoutExtendedMetadata || !efm
 
 				if removeDeletionTimestampArray.IsValid(row) && removeDeletionTimestampArray.Value(row) <= retentionTimestamp {
-					removeRowsToNull = append(removeRowsToNull, int64(row))
+					*removeRowsToNull = append(*removeRowsToNull, int64(row))
 				}
 			}
 		}
 		// Number of valid tombstones in the file: length of the array, minus length of nulls, minus length of rows we're about to null
-		tombstoneCount += (removeArray.Len() - removeArray.NullN()) - len(removeRowsToNull)
+		tombstoneCount += (removeArray.Len() - removeArray.NullN()) - len(*removeRowsToNull)
 		fileCount += addArray.Len() - addArray.NullN()
-		tombstoneDiffCount -= len(removeRowsToNull)
+		tombstoneDiffCount -= len(*removeRowsToNull)
 	}
 	appendRows := func(records *[]arrow.Record, arrowSchemaDetails *tempFileSchemaDetails, rowCount int) (bool, error) {
 		return false, nil
@@ -762,11 +763,23 @@ func onDiskRows[RowType any, PartitionType any, AddType AddPartitioned[RowType, 
 func onDiskTombstoneCheckpointRows[RowType any, PartitionType any, AddType AddPartitioned[RowType, PartitionType] | Add[RowType]](
 	tableState *DeltaTableState[RowType, PartitionType], initialOffset int, checkpointRows *[]CheckpointEntry[RowType, PartitionType, AddType],
 	config *CheckpointConfiguration) error {
-	return onDiskRows[RowType, PartitionType, AddType](
+	initialLength := len(*checkpointRows)
+	err := onDiskRows[RowType, PartitionType, AddType](
 		tableState, initialOffset, checkpointRows, config, tableState.onDiskTombstoneCountsPerPart,
 		[]string{"Root.Txn", "Root.Add", "Root.MetaData", "Root.Protocol"},
 		[]string{"txn", "add", "metaData", "protocol"},
 		func(t *tempFileSchemaDetails) int { return t.removeFieldIndex })
+	if err != nil {
+		return err
+	}
+	if tableState.onDiskRemoveExtendedFileMetadata {
+		for i := initialLength; i < len(*checkpointRows); i++ {
+			if (*checkpointRows)[i].Remove != nil {
+				(*checkpointRows)[i].Remove.ExtendedFileMetadata = false
+			}
+		}
+	}
+	return nil
 }
 
 func onDiskAddCheckpointRows[RowType any, PartitionType any, AddType AddPartitioned[RowType, PartitionType] | Add[RowType]](

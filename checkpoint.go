@@ -13,13 +13,16 @@
 package delta
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"github.com/rivian/delta-go/storage"
+	"golang.org/x/sync/errgroup"
 )
 
 // / Metadata for a checkpoint file
@@ -60,7 +63,7 @@ type CheckpointConfiguration struct {
 	// Defaults to false.
 	DisableCleanup bool
 	// Configure use of on-disk intermediate storage to reduce memory requirements
-	ReadWriteConfiguration ReadWriteTableConfiguration
+	ReadWriteConfiguration ReadWriteCheckpointConfiguration
 }
 
 func NewCheckpointConfiguration() *CheckpointConfiguration {
@@ -222,15 +225,17 @@ func createCheckpointWithAddType[RowType any, PartitionType any, AddType AddPart
 	// at a time. (Note that this does not apply to external writers such as Spark.)
 
 	var totalBytes int64 = 0
-	offsetRow := 0
-	for part := int32(0); part < numParts; part++ {
-		records, err := checkpointRows[RowType, PartitionType, AddType](tableState, offsetRow, checkpointConfiguration)
+	var rowsWritten int32 = 0
+
+	generatePart := func(part int) error {
+		partOffsetRow := part * checkpointConfiguration.MaxRowsPerPart
+		checkpointEntries, err := checkpointRows[RowType, PartitionType, AddType](tableState, partOffsetRow, checkpointConfiguration)
 		if err != nil {
 			return err
 		}
-		offsetRow += len(records)
+		atomic.AddInt32(&rowsWritten, int32(len(checkpointEntries)))
 
-		parquetBytes, err := writeStructsToParquetBytes(records)
+		parquetBytes, err := writeStructsToParquetBytes(checkpointEntries)
 		if err != nil {
 			return err
 		}
@@ -243,16 +248,62 @@ func createCheckpointWithAddType[RowType any, PartitionType any, AddType AddPart
 		checkpointPath := storage.PathFromIter([]string{"_delta_log", checkpointFileName})
 		_, err = store.Head(&checkpointPath)
 		if !errors.Is(err, storage.ErrorObjectDoesNotExist) {
-			return ErrorCheckpointAlreadyExists
+			return errors.Join(ErrorCheckpointAlreadyExists, fmt.Errorf("checkpoint file %s", checkpointPath.Raw))
 		}
 		err = store.Put(&checkpointPath, parquetBytes)
 		if err != nil {
 			return err
 		}
-		totalBytes += int64(len(parquetBytes))
+		atomic.AddInt64(&totalBytes, int64(len(parquetBytes)))
+		return nil
 	}
-	if offsetRow != totalRows {
-		return errors.Join(ErrorCheckpointRowCountMismatch, fmt.Errorf("expected %d rows, got %d rows", totalRows, offsetRow))
+
+	// Optional concurrency support
+	if checkpointConfiguration.ReadWriteConfiguration.ConcurrentCheckpointWrite > 1 {
+		g, ctx := errgroup.WithContext(context.Background())
+		partIndexChannel := make(chan int)
+
+		for i := 0; i < checkpointConfiguration.ReadWriteConfiguration.ConcurrentCheckpointWrite; i++ {
+			g.Go(func() error {
+				for part := range partIndexChannel {
+					err := generatePart(part)
+					if err != nil {
+						return err
+					}
+				}
+				return nil
+			})
+		}
+		g.Go(func() error {
+			defer close(partIndexChannel)
+			done := ctx.Done()
+			for part := 0; part < int(numParts); part++ {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				select {
+				case partIndexChannel <- part:
+					continue
+				case <-done:
+					break
+				}
+			}
+			return ctx.Err()
+		})
+		err := g.Wait()
+		if err != nil {
+			return err
+		}
+	} else {
+		for part := 0; part < int(numParts); part++ {
+			err := generatePart(part)
+			if err != nil {
+				return err
+			}
+		}
+	}
+	if int(rowsWritten) != totalRows {
+		return errors.Join(ErrorCheckpointRowCountMismatch, fmt.Errorf("expected %d rows, got %d rows", totalRows, rowsWritten))
 	}
 
 	var reportedParts *int32
@@ -266,7 +317,7 @@ func createCheckpointWithAddType[RowType any, PartitionType any, AddType AddPart
 		Size:          int64(totalRows),
 		SizeInBytes:   totalBytes,
 		Parts:         reportedParts,
-		NumOfAddFiles: int64(len(tableState.Files)),
+		NumOfAddFiles: int64(tableState.FileCount()),
 	}
 	checkpointBytes, err := json.Marshal(checkpoint)
 	if err != nil {
