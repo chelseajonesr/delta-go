@@ -27,6 +27,7 @@ import (
 	"github.com/apache/arrow/go/v13/arrow/memory"
 	"github.com/apache/arrow/go/v13/parquet/file"
 	"github.com/apache/arrow/go/v13/parquet/pqarrow"
+	"github.com/rivian/delta-go/internal/perf"
 	"github.com/rivian/delta-go/storage"
 )
 
@@ -314,6 +315,7 @@ func (tableState *DeltaTableState[RowType, PartitionType]) processCheckpointByte
 
 // / Update a table state with the contents of a checkpoint file
 func processCheckpointBytesWithAddSpecified[RowType any, PartitionType any, AddType AddPartitioned[RowType, PartitionType] | Add[RowType]](checkpointBytes []byte, tableState *DeltaTableState[RowType, PartitionType], part int, config *ReadWriteCheckpointConfiguration) error {
+	defer perf.TimeTrack(time.Now(), "processCheckpointBytesWithAddSpecified")
 	concurrentCheckpointRead := tableState.onDiskOptimization && config.ConcurrentCheckpointRead > 1
 	var processFunc = func(checkpointEntry *CheckpointEntry[RowType, PartitionType, AddType]) error {
 		var action Action
@@ -447,6 +449,7 @@ func processCheckpointBytesWithAddSpecified[RowType any, PartitionType any, AddT
 
 // / Prepare the table state for checkpointing by updating tombstones
 func (tableState *DeltaTableState[RowType, PartitionType]) prepareStateForCheckpoint(config *ReadWriteCheckpointConfiguration) error {
+	defer perf.TimeTrack(time.Now(), "prepareStateForCheckpoint")
 	if tableState.CurrentMetadata == nil {
 		return ErrorMissingMetadata
 	}
@@ -486,7 +489,7 @@ func (tableState *DeltaTableState[RowType, PartitionType]) prepareStateForCheckp
 func checkpointRows[RowType any, PartitionType any, AddType AddPartitioned[RowType, PartitionType] | Add[RowType]](
 	tableState *DeltaTableState[RowType, PartitionType], startOffset int, config *CheckpointConfiguration) ([]CheckpointEntry[RowType, PartitionType, AddType], error) {
 	var maxRowCount int
-
+	defer perf.TimeTrack(time.Now(), "checkpointRows")
 	maxRowCount = 2 + len(tableState.AppTransactionVersion) + tableState.FileCount() + tableState.TombstoneCount()
 	if config.MaxRowsPerPart < maxRowCount {
 		maxRowCount = config.MaxRowsPerPart
