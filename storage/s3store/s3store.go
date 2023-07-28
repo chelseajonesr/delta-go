@@ -296,3 +296,7 @@ func (s *S3ObjectStore) IsListOrdered() bool {
 func (s *S3ObjectStore) Writer(to *storage.Path, flag int) (io.Writer, func(), error) {
 	return nil, nil, storage.ErrorOperationNotSupported
 }
+
+func (s *S3ObjectStore) DeleteFolder(location *storage.Path) error {
+	return storage.ErrorOperationNotSupported
+}

@@ -114,6 +114,15 @@ func (s *FileObjectStore) Delete(location *storage.Path) error {
 	return nil
 }
 
+func (s *FileObjectStore) DeleteFolder(location *storage.Path) error {
+	filePath := filepath.Join(s.BaseURI.Raw, location.Raw)
+	err := os.RemoveAll(filePath)
+	if err != nil {
+		return errors.Join(storage.ErrorDeleteObject, err)
+	}
+	return nil
+}
+
 // / Convert an fs.FileInfo to a storage.ObjectMeta
 func objectMetaFromFileInfo(info fs.FileInfo, name string, isDir bool, parentDir string, trimPrefix string) *storage.ObjectMeta {
 	meta := new(storage.ObjectMeta)

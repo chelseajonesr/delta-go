@@ -172,8 +172,11 @@ type ObjectStore interface {
 	/// Return the metadata for the specified location
 	Head(location *Path) (ObjectMeta, error)
 
-	// 	/// Delete the object at the specified location.
+	/// Delete the object at the specified location.
 	Delete(location *Path) error
+
+	/// Delete the folder at the specified location.
+	DeleteFolder(location *Path) error
 
 	/// List the objects with the given prefix.  This may be limited to a certain number of objects (e.g. 1000)
 	/// based on the underlying object storage's limitations.
