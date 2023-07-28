@@ -20,12 +20,14 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/apache/arrow/go/v13/arrow"
 	"github.com/apache/arrow/go/v13/arrow/array"
 	"github.com/apache/arrow/go/v13/arrow/memory"
 	"github.com/apache/arrow/go/v13/parquet/file"
 	"github.com/apache/arrow/go/v13/parquet/pqarrow"
+	"github.com/rivian/delta-go/internal/perf"
 	"github.com/rivian/delta-go/storage"
 	"golang.org/x/sync/errgroup"
 )
@@ -57,6 +59,7 @@ func (tableState *DeltaTableState[RowType, PartitionType]) mergeOnDiskState(newT
 		(len(tableState.Tombstones) > 0 && len(newTableState.Files) > 0) ||
 		(len(tableState.Files)+len(tableState.Tombstones) > maxRowsPerPart) {
 		appended := false
+		defer perf.TimeTrack(time.Now(), "mergeOnDiskState")
 
 		mergeSinglePart := func(part int) error {
 			tryAppend := part == len(tableState.onDiskTempFiles)-1
