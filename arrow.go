@@ -20,17 +20,20 @@ import (
 	"os"
 	"reflect"
 	"strings"
+	"time"
 
 	"github.com/apache/arrow/go/v13/arrow"
 	"github.com/apache/arrow/go/v13/arrow/array"
 	"github.com/apache/arrow/go/v13/arrow/decimal128"
 	"github.com/apache/arrow/go/v13/arrow/float16"
+	"github.com/apache/arrow/go/v13/arrow/ipc"
 	"github.com/apache/arrow/go/v13/arrow/memory"
 	"github.com/apache/arrow/go/v13/parquet"
 	"github.com/apache/arrow/go/v13/parquet/compress"
 	"github.com/apache/arrow/go/v13/parquet/file"
 	"github.com/apache/arrow/go/v13/parquet/pqarrow"
 	"github.com/apache/arrow/go/v13/parquet/schema"
+	"github.com/rivian/delta-go/internal/perf"
 	"github.com/rivian/delta-go/storage"
 )
 
@@ -42,6 +45,7 @@ var (
 
 // Given an array of go structs (as reflect values), and an array of corresponding arrow Arrays, set the go struct values recursively
 func goStructFromArrowArrays(goStructs []reflect.Value, arrowArrays []arrow.Array, goNamePrefix string, goNameArrowIndexMap map[string]int, rowOffset int) error {
+	defer perf.TimeTrack(time.Now(), "goStructFromArrowArrays")
 	goType := goStructs[0].Type()
 	for goType.Kind() == reflect.Pointer {
 		goType = goType.Elem()
@@ -478,6 +482,28 @@ func writeRecords(store storage.ObjectStore, path *storage.Path, schema *arrow.S
 	return nil
 }
 
+// Write the given records to disk
+func writeRecordsArrow(store storage.ObjectStore, path *storage.Path, schema *arrow.Schema, records []arrow.Record) error {
+	ioWriter, closeFunc, err := store.Writer(path, os.O_CREATE|os.O_TRUNC)
+	if err != nil {
+		return err
+	}
+	defer closeFunc()
+	writer, err := ipc.NewFileWriter(ioWriter, ipc.WithSchema(schema))
+	if err != nil {
+		return err
+	}
+	defer writer.Close()
+
+	for _, record := range records {
+		err = writer.Write(record)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // Append a Go value to an Arrow builder
 // Recurse on nested types
 func appendGoValueToArrowBuilder(goValue reflect.Value, builder array.Builder, goNamePrefix string, goNameArrowIndexMap map[string]int) error {
@@ -639,6 +665,7 @@ func appendGoValueToArrowBuilder(goValue reflect.Value, builder array.Builder, g
 
 // Map go field names to parquet field names, and also to the arrow field index
 func getStructFieldNameToArrowIndexMappings(goType reflect.Type, goNamePrefix string, arrowFields []arrow.Field, goNameExclude []string, goNameArrowIndexMap map[string]int) error {
+	defer perf.TimeTrack(time.Now(), "getStructFieldNameToArrowIndexMappings")
 	for goType.Kind() == reflect.Pointer {
 		goType = goType.Elem()
 	}

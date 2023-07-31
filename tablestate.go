@@ -17,13 +17,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"reflect"
 	"sort"
 	"strconv"
-	"strings"
 	"time"
 
+	"github.com/apache/arrow/go/v13/arrow"
 	"github.com/apache/arrow/go/v13/arrow/array"
+	"github.com/apache/arrow/go/v13/arrow/ipc"
 	"github.com/apache/arrow/go/v13/arrow/memory"
 	"github.com/apache/arrow/go/v13/parquet/file"
 	"github.com/apache/arrow/go/v13/parquet/pqarrow"
@@ -318,13 +320,14 @@ func processCheckpointBytesWithAddSpecified[RowType any, PartitionType any, AddT
 	defer perf.TimeTrack(time.Now(), "processCheckpointBytesWithAddSpecified")
 	concurrentCheckpointRead := tableState.onDiskOptimization && config.ConcurrentCheckpointRead > 1
 	var processFunc = func(checkpointEntry *CheckpointEntry[RowType, PartitionType, AddType]) error {
+		defer perf.TimeTrack(time.Now(), "processFunc")
 		var action Action
-		if checkpointEntry.Add != nil {
-			action = checkpointEntry.Add
-		}
-		if checkpointEntry.Remove != nil {
-			action = checkpointEntry.Remove
-		}
+		// if checkpointEntry.Add != nil {
+		// action = checkpointEntry.Add
+		// }
+		// if checkpointEntry.Remove != nil {
+		// action = checkpointEntry.Remove
+		// }
 		if checkpointEntry.MetaData != nil {
 			action = checkpointEntry.MetaData
 		}
@@ -353,31 +356,44 @@ func processCheckpointBytesWithAddSpecified[RowType any, PartitionType any, AddT
 		return nil
 	}
 
-	bytesReader := bytes.NewReader(checkpointBytes)
-	parquetReader, err := file.NewParquetReader(bytesReader)
-	if err != nil {
-		return err
-	}
-
-	defaultValue := new(CheckpointEntry[RowType, PartitionType, AddType])
-	parquetSchema := parquetReader.MetaData().Schema
-	fileReader, err := pqarrow.NewFileReader(parquetReader, pqarrow.ArrowReadProperties{BatchSize: 10, Parallel: true}, memory.DefaultAllocator)
-	if err != nil {
-		return err
-	}
-	arrowSchema, err := fileReader.Schema()
-	if err != nil {
-		return err
-	}
-	arrowFieldList := arrowSchema.Fields()
-
-	inMemoryCols := make([]int, 0, 150)
-	for i := 0; i < parquetSchema.NumColumns(); i++ {
-		columnPath := parquetSchema.Column(i).ColumnPath().String()
-		if !tableState.onDiskOptimization || (!strings.HasPrefix(columnPath, "add") && !strings.HasPrefix(columnPath, "remove")) {
-			inMemoryCols = append(inMemoryCols, i)
+	var defaultValue *CheckpointEntry[RowType, PartitionType, AddType]
+	var arrowFieldList []arrow.Field
+	var fileReader *pqarrow.FileReader
+	var arrowSchema *arrow.Schema
+	var tableReader *array.TableReader
+	err := func() error {
+		defer perf.TimeTrack(time.Now(), "file reader setup")
+		bytesReader := bytes.NewReader(checkpointBytes)
+		parquetReader, err := file.NewParquetReader(bytesReader)
+		if err != nil {
+			return err
 		}
+
+		defaultValue = new(CheckpointEntry[RowType, PartitionType, AddType])
+		fileReader, err = pqarrow.NewFileReader(parquetReader, pqarrow.ArrowReadProperties{BatchSize: 10, Parallel: true}, memory.DefaultAllocator)
+		if err != nil {
+			return err
+		}
+		arrowSchema, err = fileReader.Schema()
+		if err != nil {
+			return err
+		}
+		arrowFieldList = arrowSchema.Fields()
+
+		// Read a row group at a time; process in-memory actions
+		tbl, err := fileReader.ReadTable(context.TODO())
+		if err != nil {
+			return err
+		}
+		defer tbl.Release()
+
+		tableReader = array.NewTableReader(tbl, 0)
+		return nil
+	}()
+	if err != nil {
+		return err
 	}
+	defer tableReader.Release()
 
 	// Get mappings between struct member names and parquet/arrow names so we don't have to look them up repeatedly
 	// during record assignments
@@ -392,53 +408,67 @@ func processCheckpointBytesWithAddSpecified[RowType any, PartitionType any, AddT
 		return err
 	}
 
-	// Read a row group at a time; process in-memory actions
-	for i := 0; i < parquetReader.NumRowGroups(); i++ {
-		tbl, err := fileReader.ReadRowGroups(context.TODO(), inMemoryCols, []int{i})
+	var writer *ipc.FileWriter
+	if tableState.onDiskOptimization {
+		onDiskFile := storage.PathFromIter([]string{config.WorkingFolder.Raw, fmt.Sprintf("intermediate.%d.arrow", part)})
+		tableState.onDiskTempFiles = append(tableState.onDiskTempFiles, onDiskFile)
+		ioWriter, closeFunc, err := config.WorkingStore.Writer(&onDiskFile, os.O_CREATE|os.O_TRUNC)
 		if err != nil {
 			return err
 		}
-		defer tbl.Release()
+		defer closeFunc()
+		writer, err = ipc.NewFileWriter(ioWriter, ipc.WithSchema(arrowSchema))
+		if err != nil {
+			return err
+		}
+		defer writer.Close()
+	}
 
-		tableReader := array.NewTableReader(tbl, 0)
-		defer tableReader.Release()
+	for tableReader.Next() {
+		record := tableReader.Record()
 
-		for tableReader.Next() {
-			// the record contains a batch of rows
-			record := tableReader.Record()
+		if tableState.onDiskOptimization {
+			err = countAddsAndTombstonesAndWrite(tableState, writer, record, arrowSchema)
+			if err != nil {
+				return err
+			}
+		}
 
-			entries := make([]*CheckpointEntry[RowType, PartitionType, AddType], record.NumRows())
-			entryValues := make([]reflect.Value, record.NumRows())
+		entries := make([]*CheckpointEntry[RowType, PartitionType, AddType], record.NumRows())
+		entryValues := make([]reflect.Value, record.NumRows())
+		func() {
+			defer perf.TimeTrack(time.Now(), "allocating")
 			for j := int64(0); j < record.NumRows(); j++ {
 				t := new(CheckpointEntry[RowType, PartitionType, AddType])
 				entries[j] = t
 				entryValues[j] = reflect.ValueOf(t)
 			}
+		}()
 
-			goStructFromArrowArrays(entryValues, record.Columns(), "Root", inMemoryIndexMappings, 0)
+		inMemoryColumns := make([]arrow.Array, 0, 3)
+		for i := 0; i < int(record.NumCols()); i++ {
+			c := record.ColumnName(i)
+			if c == "txn" || c == "metaData" || c == "protocol" {
+				inMemoryColumns = append(inMemoryColumns, record.Column(i))
+			}
+		}
+		err = func() error {
+			defer perf.TimeTrack(time.Now(), "all goStructFromArrowArrays")
+			return goStructFromArrowArrays(entryValues, inMemoryColumns, "Root", inMemoryIndexMappings, 0)
+		}()
+		if err != nil {
+			return err
+		}
+		err = func() error {
+			defer perf.TimeTrack(time.Now(), "all processFunc")
 			for j := int64(0); j < record.NumRows(); j++ {
-				err = processFunc(entries[j])
+				err := processFunc(entries[j])
 				if err != nil {
 					return err
 				}
 			}
-			if err != nil {
-				return err
-			}
-		}
-	}
-
-	if tableState.onDiskOptimization {
-		// The non-add, non-remove columns will be almost entirely nulls, so picking out just add and remove
-		// slows us down here for a very minimal improvement in file size.
-		// Instead we just write out the entire file.
-		onDiskFile := storage.PathFromIter([]string{config.WorkingFolder.Raw, fmt.Sprintf("intermediate.%d.parquet", part)})
-		config.WorkingStore.Put(&onDiskFile, checkpointBytes)
-		tableState.onDiskTempFiles = append(tableState.onDiskTempFiles, onDiskFile)
-
-		// Store the number of add and remove records locally
-		// These counts are required later for generating new checkpoints
-		err = countAddsAndTombstones(tableState, checkpointBytes, arrowSchema, config)
+			return nil
+		}()
 		if err != nil {
 			return err
 		}

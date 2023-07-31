@@ -20,6 +20,8 @@ import (
 	"net/url"
 	"path/filepath"
 	"time"
+
+	"github.com/apache/arrow/go/v13/arrow/ipc"
 )
 
 var (
@@ -237,10 +239,12 @@ type ObjectStore interface {
 	// Will return an error if the destination already has an object.
 	RenameIfNotExists(from *Path, to *Path) error
 
-	// Allow use of an ObjectStore as an io.Writer
+	// Allow use of an ObjectStore as an io.WriteSeeker
 	// If error is nil, then the returned function should be called with a defer to close resources
 	// Writer may not be supported for all store types
-	Writer(to *Path, flag int) (io.Writer, func(), error)
+	Writer(to *Path, flag int) (io.WriteSeeker, func(), error)
+	// TODO get ipc out of here
+	Reader(from *Path) (ipc.ReadAtSeeker, func(), error)
 }
 
 // / Wrapper around List that will perform paging if required

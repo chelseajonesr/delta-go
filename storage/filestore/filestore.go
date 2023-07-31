@@ -21,6 +21,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/apache/arrow/go/v13/arrow/ipc"
 	"github.com/rivian/delta-go/storage"
 )
 
@@ -235,7 +236,7 @@ func (s *FileObjectStore) IsListOrdered() bool {
 	return true
 }
 
-func (s *FileObjectStore) Writer(location *storage.Path, flag int) (io.Writer, func(), error) {
+func (s *FileObjectStore) Writer(location *storage.Path, flag int) (io.WriteSeeker, func(), error) {
 	writePath := filepath.Join(s.BaseURI.Raw, location.Raw)
 	err := os.MkdirAll(filepath.Dir(writePath), 0700)
 	if err != nil {
@@ -243,5 +244,11 @@ func (s *FileObjectStore) Writer(location *storage.Path, flag int) (io.Writer, f
 	}
 
 	f, err := os.OpenFile(writePath, os.O_WRONLY|flag, 0700)
+	return f, func() { f.Close() }, err
+}
+
+func (s *FileObjectStore) Reader(location *storage.Path) (ipc.ReadAtSeeker, func(), error) {
+	readPath := filepath.Join(s.BaseURI.Raw, location.Raw)
+	f, err := os.OpenFile(readPath, os.O_RDONLY, 0700)
 	return f, func() { f.Close() }, err
 }

@@ -13,7 +13,6 @@
 package delta
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -24,9 +23,8 @@ import (
 
 	"github.com/apache/arrow/go/v13/arrow"
 	"github.com/apache/arrow/go/v13/arrow/array"
+	"github.com/apache/arrow/go/v13/arrow/ipc"
 	"github.com/apache/arrow/go/v13/arrow/memory"
-	"github.com/apache/arrow/go/v13/parquet/file"
-	"github.com/apache/arrow/go/v13/parquet/pqarrow"
 	"github.com/rivian/delta-go/internal/perf"
 	"github.com/rivian/delta-go/storage"
 	"golang.org/x/sync/errgroup"
@@ -142,7 +140,7 @@ func (tableState *DeltaTableState[RowType, PartitionType]) mergeOnDiskState(newT
 			(*schemaDetails).schema = newRecord.Schema()
 
 			onDiskFile := storage.PathFromIter([]string{config.WorkingFolder.Raw, fmt.Sprintf("intermediate.%d.parquet", len(tableState.onDiskTempFiles))})
-			err = writeRecords(config.WorkingStore, &onDiskFile, schemaDetails.schema, []arrow.Record{newRecord})
+			err = writeRecordsArrow(config.WorkingStore, &onDiskFile, schemaDetails.schema, []arrow.Record{newRecord})
 			if err != nil {
 				return err
 			}
@@ -224,7 +222,6 @@ func updateOnDiskPartState[RowType any, PartitionType any](
 	store storage.ObjectStore, path *storage.Path,
 	getRowsToNull func(record arrow.Record, arrowSchemaDetails *tempFileSchemaDetails, addRowsToNull *[]int64, removeRowsToNull *[]int64),
 	appendRows func(records *[]arrow.Record, arrowSchemaDetails *tempFileSchemaDetails, rowCount int) (bool, error)) error {
-
 	changed := false
 
 	tableReader, _, arrowSchemaDetails, deferFuncs, err := openFileForTableReader(store, path, nil)
@@ -239,8 +236,11 @@ func updateOnDiskPartState[RowType any, PartitionType any](
 	// As we start appending new records while iterating the commit logs, we can expect multiple chunks per table
 	rowCount := 0
 	records := make([]arrow.Record, 0, 10)
-	for tableReader.Next() {
-		record := tableReader.Record()
+	for i := 0; i < tableReader.NumRecords(); i++ {
+		record, err := tableReader.Read()
+		if err != nil {
+			return err
+		}
 		record.Retain()
 		rowCount += int(record.NumRows())
 		// Locate changes to the add and remove columns
@@ -285,7 +285,7 @@ func updateOnDiskPartState[RowType any, PartitionType any](
 	changed = changed || appended
 
 	if changed {
-		err := writeRecords(store, path, arrowSchemaDetails.schema, records)
+		err := writeRecordsArrow(store, path, arrowSchemaDetails.schema, records)
 		if err != nil {
 			return err
 		}
@@ -298,40 +298,20 @@ func updateOnDiskPartState[RowType any, PartitionType any](
 }
 
 // Count the adds and tombstones in a checkpoint file and add them to the state total
-func countAddsAndTombstones[RowType any, PartitionType any](tableState *DeltaTableState[RowType, PartitionType], checkpointBytes []byte, arrowSchema *arrow.Schema, config *ReadWriteCheckpointConfiguration) error {
+func countAddsAndTombstonesAndWrite[RowType any, PartitionType any](tableState *DeltaTableState[RowType, PartitionType], writer *ipc.FileWriter, record arrow.Record, arrowSchema *arrow.Schema) error {
+	defer perf.TimeTrack(time.Now(), "countAddsAndTombstonesAndWrite")
 	arrowSchemaDetails := new(tempFileSchemaDetails)
 	err := arrowSchemaDetails.setFromArrowSchema(arrowSchema, nil)
 	if err != nil {
 		return err
 	}
+	addPathArray := record.Column(arrowSchemaDetails.addFieldIndex).(*array.Struct).Field(arrowSchemaDetails.addPathFieldIndex).(*array.String)
+	removePathArray := record.Column(arrowSchemaDetails.removeFieldIndex).(*array.Struct).Field(arrowSchemaDetails.removePathFieldIndex).(*array.String)
+	tableState.updateOnDiskCounts(addPathArray.Len()-addPathArray.NullN(), removePathArray.Len()-removePathArray.NullN())
 
-	bytesReader := bytes.NewReader(checkpointBytes)
-	parquetReader, err := file.NewParquetReader(bytesReader)
+	err = writer.Write(record)
 	if err != nil {
 		return err
-	}
-	defer parquetReader.Close()
-	arrowRdr, err := pqarrow.NewFileReader(parquetReader, pqarrow.ArrowReadProperties{Parallel: true, BatchSize: 10}, memory.DefaultAllocator)
-	if err != nil {
-		return err
-	}
-
-	tbl, err := arrowRdr.ReadTable(context.TODO())
-	if err != nil {
-		return err
-	}
-	defer tbl.Release()
-
-	tableReader := array.NewTableReader(tbl, 0)
-	defer tableReader.Release()
-
-	rowCount := 0
-	for tableReader.Next() {
-		record := tableReader.Record()
-		rowCount += int(record.NumRows())
-		addPathArray := record.Column(arrowSchemaDetails.addFieldIndex).(*array.Struct).Field(arrowSchemaDetails.addPathFieldIndex).(*array.String)
-		removePathArray := record.Column(arrowSchemaDetails.removeFieldIndex).(*array.Struct).Field(arrowSchemaDetails.removePathFieldIndex).(*array.String)
-		tableState.updateOnDiskCounts(addPathArray.Len()-addPathArray.NullN(), removePathArray.Len()-removePathArray.NullN())
 	}
 	return nil
 }
@@ -688,7 +668,7 @@ func onDiskRows[RowType any, PartitionType any, AddType AddPartitioned[RowType, 
 
 			// Use a function to make per-file defer cleanup simpler
 			err := func() error {
-				tableReader, arrowSchema, schemaDetails, deferFuncs, err := openFileForTableReader(config.ReadWriteConfiguration.WorkingStore, &f, arrowFieldExclusions)
+				tableReader, arrowSchema, schemaDetails, deferFuncs, err := openFileForTableReader(config.ReadWriteConfiguration.WorkingStore, &f, []string{})
 				for _, d := range deferFuncs {
 					defer d()
 				}
@@ -712,7 +692,7 @@ func onDiskRows[RowType any, PartitionType any, AddType AddPartitioned[RowType, 
 				defaultValue := new(CheckpointEntry[RowType, PartitionType, AddType])
 				schemaIndexMappings := make(map[string]int, 100)
 				defaultType := reflect.TypeOf(defaultValue)
-				err = getStructFieldNameToArrowIndexMappings(defaultType, "Root", arrowSchema.Fields(), structFieldExclusions, schemaIndexMappings)
+				err = getStructFieldNameToArrowIndexMappings(defaultType, "Root", arrowSchema.Fields(), []string{}, schemaIndexMappings)
 				if err != nil {
 					return err
 				}
@@ -726,8 +706,11 @@ func onDiskRows[RowType any, PartitionType any, AddType AddPartitioned[RowType, 
 				entryCount := 0
 				columnIdx := validityIndex(schemaDetails)
 
-				for tableReader.Next() && entryCount < expectedRows {
-					record := tableReader.Record()
+				for i := 0; i < tableReader.NumRecords() && entryCount < expectedRows; i++ {
+					record, err := tableReader.Read()
+					if err != nil {
+						return err
+					}
 					requiredStructArray := record.Column(columnIdx).(*array.Struct)
 					for row := partRowOffset; row < int(record.NumRows()) && entryCount < expectedRows; row++ {
 						// Is there a required action in this row
@@ -799,29 +782,21 @@ func onDiskAddCheckpointRows[RowType any, PartitionType any, AddType AddPartitio
 // / even if an error is also returned.
 // / Also, the cleanup functions do cleanup for everything including the returned TableReader
 // / If excludePrefixes is set, the parquet schema will be adjusted to skip reading any columns starting with that prefix
-func openFileForTableReader(store storage.ObjectStore, path *storage.Path, excludePrefixes []string) (*array.TableReader, *arrow.Schema, *tempFileSchemaDetails, []func(), error) {
+func openFileForTableReader(store storage.ObjectStore, path *storage.Path, excludePrefixes []string) (*ipc.FileReader, *arrow.Schema, *tempFileSchemaDetails, []func(), error) {
 	deferFuncs := make([]func(), 0, 3)
-	checkpointBytes, err := store.Get(path)
-	if err != nil {
-		return nil, nil, nil, deferFuncs, err
-	}
-	bytesReader := bytes.NewReader(checkpointBytes)
-	parquetReader, err := file.NewParquetReader(bytesReader)
+	ioReader, closeFunc, err := store.Reader(path)
+	deferFuncs = append(deferFuncs, closeFunc)
+	reader, err := ipc.NewFileReader(ioReader)
 	if err != nil {
 		return nil, nil, nil, deferFuncs, err
 	}
 	closeIgnoreErr := func() {
-		parquetReader.Close()
+		reader.Close()
 	}
 	deferFuncs = append(deferFuncs, closeIgnoreErr)
 
-	arrowRdr, err := pqarrow.NewFileReader(parquetReader, pqarrow.ArrowReadProperties{Parallel: true, BatchSize: 10}, memory.DefaultAllocator)
-	if err != nil {
-		return nil, nil, nil, deferFuncs, err
-	}
-
 	schemaDetails := new(tempFileSchemaDetails)
-	arrowSchema, err := arrowRdr.Schema()
+	arrowSchema := reader.Schema()
 	if err != nil {
 		return nil, nil, nil, deferFuncs, err
 	}
@@ -830,36 +805,37 @@ func openFileForTableReader(store storage.ObjectStore, path *storage.Path, exclu
 		return nil, nil, nil, deferFuncs, err
 	}
 
-	var tbl arrow.Table
+	// var tbl arrow.Table
 
-	if len(excludePrefixes) > 0 {
-		parquetSchema := parquetReader.MetaData().Schema
-		allowedCols := make([]int, 0, 150)
-	checkColumn:
-		for i := 0; i < parquetSchema.NumColumns(); i++ {
-			columnPath := parquetSchema.Column(i).ColumnPath().String()
-			for _, prefix := range excludePrefixes {
-				if strings.HasPrefix(columnPath, prefix) {
-					continue checkColumn
-				}
-			}
-			allowedCols = append(allowedCols, i)
-		}
-		rowgroups := make([]int, arrowRdr.ParquetReader().NumRowGroups())
-		for i := 0; i < arrowRdr.ParquetReader().NumRowGroups(); i++ {
-			rowgroups[i] = i
-		}
-		tbl, err = arrowRdr.ReadRowGroups(context.TODO(), allowedCols, rowgroups)
-	} else {
-		tbl, err = arrowRdr.ReadTable(context.TODO())
-	}
-	if err != nil {
-		return nil, nil, nil, deferFuncs, err
-	}
-	deferFuncs = append(deferFuncs, tbl.Release)
+	// if len(excludePrefixes) > 0 {
+	// 	parquetSchema := parquetReader.MetaData().Schema
+	// 	allowedCols := make([]int, 0, 150)
+	// checkColumn:
+	// 	for i := 0; i < parquetSchema.NumColumns(); i++ {
+	// 		columnPath := parquetSchema.Column(i).ColumnPath().String()
+	// 		for _, prefix := range excludePrefixes {
+	// 			if strings.HasPrefix(columnPath, prefix) {
+	// 				continue checkColumn
+	// 			}
+	// 		}
+	// 		allowedCols = append(allowedCols, i)
+	// 	}
+	// 	rowgroups := make([]int, arrowRdr.ParquetReader().NumRowGroups())
+	// 	for i := 0; i < arrowRdr.ParquetReader().NumRowGroups(); i++ {
+	// 		rowgroups[i] = i
+	// 	}
+	// 	tbl, err = arrowRdr.ReadRowGroups(context.TODO(), allowedCols, rowgroups)
+	// } else {
+	// 	tbl, err = arrowRdr.ReadTable(context.TODO())
+	// }
 
-	tableReader := array.NewTableReader(tbl, 0)
-	deferFuncs = append(deferFuncs, tableReader.Release)
+	// if err != nil {
+	// 	return nil, nil, nil, deferFuncs, err
+	// }
+	// deferFuncs = append(deferFuncs, tbl.Release)
 
-	return tableReader, arrowSchema, schemaDetails, deferFuncs, nil
+	// tableReader := array.NewTableReader(tbl, 0)
+	// deferFuncs = append(deferFuncs, tableReader.Release)
+
+	return reader, arrowSchema, schemaDetails, deferFuncs, nil
 }

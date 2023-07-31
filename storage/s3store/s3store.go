@@ -22,6 +22,7 @@ import (
 	"net/url"
 	"strings"
 
+	"github.com/apache/arrow/go/v13/arrow/ipc"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -293,7 +294,11 @@ func (s *S3ObjectStore) IsListOrdered() bool {
 	return true
 }
 
-func (s *S3ObjectStore) Writer(to *storage.Path, flag int) (io.Writer, func(), error) {
+func (s *S3ObjectStore) Writer(to *storage.Path, flag int) (io.WriteSeeker, func(), error) {
+	return nil, nil, storage.ErrorOperationNotSupported
+}
+
+func (s *S3ObjectStore) Reader(from *storage.Path) (ipc.ReadAtSeeker, func(), error) {
 	return nil, nil, storage.ErrorOperationNotSupported
 }
 

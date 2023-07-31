@@ -27,6 +27,7 @@ var (
 
 func Init() {
 	timings = make(map[string][]float64, 20)
+	perfInitialized = true
 }
 func TimeTrack(start time.Time, name string) {
 	if !perfInitialized {
