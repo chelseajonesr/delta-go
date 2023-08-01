@@ -315,7 +315,9 @@ func (tableState *DeltaTableState[RowType, PartitionType]) processCheckpointByte
 
 // / Update a table state with the contents of a checkpoint file
 func processCheckpointBytesWithAddSpecified[RowType any, PartitionType any, AddType AddPartitioned[RowType, PartitionType] | Add[RowType]](checkpointBytes []byte, tableState *DeltaTableState[RowType, PartitionType], part int, config *ReadWriteCheckpointConfiguration) error {
-	defer perf.TimeTrack(time.Now(), "processCheckpointBytesWithAddSpecified")
+	defer perf.TrackTime(time.Now(), "processCheckpointBytesWithAddSpecified")
+	perf.SnapshotMemory("processCheckpointBytesWithAddSpecified beginning")
+
 	concurrentCheckpointRead := tableState.onDiskOptimization && config.ConcurrentCheckpointRead > 1
 	var processFunc = func(checkpointEntry *CheckpointEntry[RowType, PartitionType, AddType]) error {
 		var action Action
@@ -415,13 +417,23 @@ func processCheckpointBytesWithAddSpecified[RowType any, PartitionType any, AddT
 				entryValues[j] = reflect.ValueOf(t)
 			}
 
-			goStructFromArrowArrays(entryValues, record.Columns(), "Root", inMemoryIndexMappings, 0)
-			for j := int64(0); j < record.NumRows(); j++ {
-				err = processFunc(entries[j])
-				if err != nil {
-					return err
-				}
+			err = func() error {
+				defer perf.TrackTime(time.Now(), "reading goStructFromArrowArrays")
+				return goStructFromArrowArrays(entryValues, record.Columns(), "Root", inMemoryIndexMappings, 0)
+			}()
+			if err != nil {
+				return err
 			}
+			err = func() error {
+				defer perf.TrackTime(time.Now(), "reading processFunc")
+				for j := int64(0); j < record.NumRows(); j++ {
+					err := processFunc(entries[j])
+					if err != nil {
+						return err
+					}
+				}
+				return nil
+			}()
 			if err != nil {
 				return err
 			}
@@ -443,13 +455,16 @@ func processCheckpointBytesWithAddSpecified[RowType any, PartitionType any, AddT
 			return err
 		}
 	}
+	perf.SnapshotMemory("processCheckpointBytesWithAddSpecified end")
 
 	return nil
 }
 
 // / Prepare the table state for checkpointing by updating tombstones
 func (tableState *DeltaTableState[RowType, PartitionType]) prepareStateForCheckpoint(config *ReadWriteCheckpointConfiguration) error {
-	defer perf.TimeTrack(time.Now(), "prepareStateForCheckpoint")
+	defer perf.TrackTime(time.Now(), "prepareStateForCheckpoint")
+	perf.SnapshotMemory("prepareStateForCheckpoint beginning")
+
 	if tableState.CurrentMetadata == nil {
 		return ErrorMissingMetadata
 	}
@@ -482,6 +497,7 @@ func (tableState *DeltaTableState[RowType, PartitionType]) prepareStateForCheckp
 			// TODO - do we need to remove the extra settings if it was true?
 		}
 	}
+	perf.SnapshotMemory("prepareStateForCheckpoint end")
 	return nil
 }
 
@@ -489,12 +505,14 @@ func (tableState *DeltaTableState[RowType, PartitionType]) prepareStateForCheckp
 func checkpointRows[RowType any, PartitionType any, AddType AddPartitioned[RowType, PartitionType] | Add[RowType]](
 	tableState *DeltaTableState[RowType, PartitionType], startOffset int, config *CheckpointConfiguration) ([]CheckpointEntry[RowType, PartitionType, AddType], error) {
 	var maxRowCount int
-	defer perf.TimeTrack(time.Now(), "checkpointRows")
+	defer perf.TrackTime(time.Now(), "checkpointRows")
+	perf.SnapshotMemory("checkpointRows beginning")
 	maxRowCount = 2 + len(tableState.AppTransactionVersion) + tableState.FileCount() + tableState.TombstoneCount()
 	if config.MaxRowsPerPart < maxRowCount {
 		maxRowCount = config.MaxRowsPerPart
 	}
 	checkpointRows := make([]CheckpointEntry[RowType, PartitionType, AddType], 0, maxRowCount)
+	perf.SnapshotMemory("checkpointRows beginning")
 
 	currentOffset := 0
 
@@ -601,6 +619,7 @@ func checkpointRows[RowType any, PartitionType any, AddType AddPartitioned[RowTy
 			}
 		}
 	}
+	perf.SnapshotMemory("checkpointRows end")
 
 	return checkpointRows, nil
 }

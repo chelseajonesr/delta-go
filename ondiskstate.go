@@ -59,7 +59,7 @@ func (tableState *DeltaTableState[RowType, PartitionType]) mergeOnDiskState(newT
 		(len(tableState.Tombstones) > 0 && len(newTableState.Files) > 0) ||
 		(len(tableState.Files)+len(tableState.Tombstones) > maxRowsPerPart) {
 		appended := false
-		defer perf.TimeTrack(time.Now(), "mergeOnDiskState")
+		defer perf.TrackTime(time.Now(), "mergeOnDiskState")
 
 		mergeSinglePart := func(part int) error {
 			tryAppend := part == len(tableState.onDiskTempFiles)-1
@@ -299,6 +299,8 @@ func updateOnDiskPartState[RowType any, PartitionType any](
 
 // Count the adds and tombstones in a checkpoint file and add them to the state total
 func countAddsAndTombstones[RowType any, PartitionType any](tableState *DeltaTableState[RowType, PartitionType], checkpointBytes []byte, arrowSchema *arrow.Schema, config *ReadWriteCheckpointConfiguration) error {
+	perf.SnapshotMemory("countAddsAndTombstones beginning")
+
 	arrowSchemaDetails := new(tempFileSchemaDetails)
 	err := arrowSchemaDetails.setFromArrowSchema(arrowSchema, nil)
 	if err != nil {
@@ -333,6 +335,7 @@ func countAddsAndTombstones[RowType any, PartitionType any](tableState *DeltaTab
 		removePathArray := record.Column(arrowSchemaDetails.removeFieldIndex).(*array.Struct).Field(arrowSchemaDetails.removePathFieldIndex).(*array.String)
 		tableState.updateOnDiskCounts(addPathArray.Len()-addPathArray.NullN(), removePathArray.Len()-removePathArray.NullN())
 	}
+	perf.SnapshotMemory("countAddsAndTombstones end")
 	return nil
 }
 
@@ -677,7 +680,7 @@ func prepareOnDiskPartStateForCheckpoint[RowType any, PartitionType any](store s
 func onDiskRows[RowType any, PartitionType any, AddType AddPartitioned[RowType, PartitionType] | Add[RowType]](
 	tableState *DeltaTableState[RowType, PartitionType], initialOffset int, checkpointRows *[]CheckpointEntry[RowType, PartitionType, AddType], config *CheckpointConfiguration,
 	partRowCountArray []int, structFieldExclusions []string, arrowFieldExclusions []string, validityIndex func(*tempFileSchemaDetails) int) error {
-
+	perf.SnapshotMemory("onDiskRows 1")
 	// Figure out which part file
 	partRowsProcessed := 0
 	for part, f := range tableState.onDiskTempFiles {
@@ -760,6 +763,8 @@ func onDiskRows[RowType any, PartitionType any, AddType AddPartitioned[RowType, 
 		}
 		partRowsProcessed += currentPartRows
 	}
+	perf.SnapshotMemory("onDiskRows 2")
+
 	return nil
 }
 
