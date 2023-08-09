@@ -445,6 +445,7 @@ func processCheckpointBytesWithAddSpecified[RowType any, PartitionType any, AddT
 		// slows us down here for a very minimal improvement in file size.
 		// Instead we just write out the entire file.
 		onDiskFile := storage.PathFromIter([]string{config.WorkingFolder.Raw, fmt.Sprintf("intermediate.%d.parquet", part)})
+		perf.TrackOperationThreadSafe("finalization.processCheckpointBytesWithAddSpecified.write")
 		config.WorkingStore.Put(&onDiskFile, checkpointBytes)
 		tableState.onDiskTempFiles = append(tableState.onDiskTempFiles, onDiskFile)
 

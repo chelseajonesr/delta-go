@@ -142,6 +142,7 @@ func (tableState *DeltaTableState[RowType, PartitionType]) mergeOnDiskState(newT
 			(*schemaDetails).schema = newRecord.Schema()
 
 			onDiskFile := storage.PathFromIter([]string{config.WorkingFolder.Raw, fmt.Sprintf("intermediate.%d.parquet", len(tableState.onDiskTempFiles))})
+			perf.TrackOperationThreadSafe("update.mergeOnDiskState.write")
 			err = writeRecords(config.WorkingStore, &onDiskFile, schemaDetails.schema, []arrow.Record{newRecord})
 			if err != nil {
 				return err
@@ -214,19 +215,21 @@ func mergeNewAddsAndRemovesToOnDiskPartState[RowType any, PartitionType any](
 		return false, nil
 	}
 
-	err := updateOnDiskPartState[RowType, PartitionType](store, path, getRowsToNull, appendRows)
+	err := updateOnDiskPartState[RowType, PartitionType]("update.mergeNewAddsAndRemovesToOnDiskPartState", store, path, getRowsToNull, appendRows)
 	return appended, addDiffCount, tombstoneDiffCount, err
 }
 
 // Update the on-disk state in the given file with the new adds and removes
 // This may be called concurrently on multiple checkpoint parts
 func updateOnDiskPartState[RowType any, PartitionType any](
+	caller string,
 	store storage.ObjectStore, path *storage.Path,
 	getRowsToNull func(record arrow.Record, arrowSchemaDetails *tempFileSchemaDetails, addRowsToNull *[]int64, removeRowsToNull *[]int64),
 	appendRows func(records *[]arrow.Record, arrowSchemaDetails *tempFileSchemaDetails, rowCount int) (bool, error)) error {
 
 	changed := false
 
+	perf.TrackOperationThreadSafe(fmt.Sprintf("%s.updateOnDiskPartState.read", caller))
 	tableReader, _, arrowSchemaDetails, deferFuncs, err := openFileForTableReader(store, path, nil)
 	for _, d := range deferFuncs {
 		defer d()
@@ -285,6 +288,7 @@ func updateOnDiskPartState[RowType any, PartitionType any](
 	changed = changed || appended
 
 	if changed {
+		perf.TrackOperationThreadSafe(fmt.Sprintf("%s.updateOnDiskPartState.write", caller))
 		err := writeRecords(store, path, arrowSchemaDetails.schema, records)
 		if err != nil {
 			return err
@@ -673,7 +677,7 @@ func prepareOnDiskPartStateForCheckpoint[RowType any, PartitionType any](store s
 		return false, nil
 	}
 
-	err := updateOnDiskPartState[RowType, PartitionType](store, path, getRowsToNull, appendRows)
+	err := updateOnDiskPartState[RowType, PartitionType]("finalization.prepareOnDiskPartStateForCheckpoint", store, path, getRowsToNull, appendRows)
 	return tombstoneWithoutExtendedMetadata, tombstoneDiffCount, fileCount, tombstoneCount, err
 }
 
@@ -691,6 +695,7 @@ func onDiskRows[RowType any, PartitionType any, AddType AddPartitioned[RowType, 
 
 			// Use a function to make per-file defer cleanup simpler
 			err := func() error {
+				perf.TrackOperationThreadSafe("finalization.onDiskRows.read")
 				tableReader, arrowSchema, schemaDetails, deferFuncs, err := openFileForTableReader(config.ReadWriteConfiguration.WorkingStore, &f, arrowFieldExclusions)
 				for _, d := range deferFuncs {
 					defer d()

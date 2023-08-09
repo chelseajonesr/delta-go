@@ -16,6 +16,7 @@ import (
 	"log"
 	"runtime"
 	"sort"
+	"sync"
 	"time"
 
 	"gonum.org/v1/gonum/floats"
@@ -23,17 +24,21 @@ import (
 )
 
 var (
-	timings         map[string][]float64
-	memorySnapshots map[string][]runtime.MemStats
-	initialized     bool
+	timings                map[string][]float64
+	memorySnapshots        map[string][]runtime.MemStats
+	operationCounters      map[string]int32
+	operationCountersMutex sync.Mutex
+	initialized            bool
 )
 
 func Init() {
 	timings = make(map[string][]float64, 20)
 	memorySnapshots = make(map[string][]runtime.MemStats, 20)
+	operationCounters = make(map[string]int32, 10)
 	initialized = true
 }
 
+// Not threadsafe
 func TrackTime(start time.Time, name string) {
 	if !initialized {
 		return
@@ -47,6 +52,7 @@ func TrackTime(start time.Time, name string) {
 	timings[name] = durations
 }
 
+// Not threadsafe
 func SnapshotMemory(name string) {
 	if !initialized {
 		return
@@ -59,6 +65,38 @@ func SnapshotMemory(name string) {
 	}
 	snapshots = append(snapshots, m)
 	memorySnapshots[name] = snapshots
+}
+
+func TrackOperationThreadSafe(name string) {
+	if !initialized {
+		return
+	}
+	operationCountersMutex.Lock()
+	defer operationCountersMutex.Unlock()
+	oldVal, present := operationCounters[name]
+	var newVal int32
+	if present {
+		newVal = oldVal + 1
+	} else {
+		newVal = 1
+	}
+	operationCounters[name] = newVal
+}
+
+func PrintOperations() {
+	if !initialized {
+		return
+	}
+	names := make([]string, 0, len(operationCounters))
+	for k := range operationCounters {
+		names = append(names, k)
+	}
+	sort.Strings(names)
+	for _, k := range names {
+		operationCounter := operationCounters[k]
+		log.Printf("%s count: %d", k, operationCounter)
+	}
+	log.Printf("==================================")
 }
 
 func PrintTimings(verbose bool) {
@@ -82,6 +120,7 @@ func PrintTimings(verbose bool) {
 		}
 		log.Printf("----------------------------------")
 	}
+	log.Printf("==================================")
 }
 
 func PrintSnapshots(verbose bool) {
@@ -127,4 +166,5 @@ func PrintSnapshots(verbose bool) {
 		}
 		log.Printf("----------------------------------")
 	}
+	log.Printf("==================================")
 }

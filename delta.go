@@ -462,6 +462,10 @@ func (table *DeltaTable[RowType, PartitionType]) updateIncremental(maxVersion *i
 		if err != nil {
 			return err
 		}
+
+		if table.State.Version%500 == 0 {
+			log.Printf("Version %d", table.State.Version)
+		}
 	}
 
 	if table.State.Version == -1 {
