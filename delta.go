@@ -13,6 +13,7 @@
 package delta
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -22,6 +23,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/redis/go-redis/v9"
 	"github.com/rivian/delta-go/lock"
 	"github.com/rivian/delta-go/state"
 	"github.com/rivian/delta-go/storage"
@@ -77,6 +79,8 @@ type ReadWriteCheckpointConfiguration struct {
 	WorkingFolder             *storage.Path
 	ConcurrentCheckpointRead  int
 	ConcurrentCheckpointWrite int
+	RedisClient               redis.UniversalClient
+	Ctx                       context.Context
 }
 
 // Create a new Delta Table struct without loading any data from backing storage.

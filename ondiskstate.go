@@ -17,9 +17,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/apache/arrow/go/v13/arrow"
@@ -27,6 +29,7 @@ import (
 	"github.com/apache/arrow/go/v13/arrow/memory"
 	"github.com/apache/arrow/go/v13/parquet/file"
 	"github.com/apache/arrow/go/v13/parquet/pqarrow"
+	"github.com/redis/go-redis/v9"
 	"github.com/rivian/delta-go/internal/perf"
 	"github.com/rivian/delta-go/storage"
 	"golang.org/x/sync/errgroup"
@@ -48,7 +51,19 @@ type OnDiskTableState struct {
 	onDiskTombstoneCountsPerPart []int
 	// Whether to remove extended file metadata from all tombstones in checkpoint generation
 	onDiskRemoveExtendedFileMetadata bool
+	// Redis client for the path layer
+	redisClient redis.UniversalClient
+	ctx         context.Context
+	notExtCount atomic.Int64
 }
+
+const validRemoveKey = "vrem"
+const validAddKey = "vadd"
+const removeKeyPattern = "rem:%s"
+const addKeyPattern = "add:%s"
+const timestampListKey = "trem"
+const timestampPathListKeyPattern = "ts:%s"
+const timestampIntPathListKeyPattern = "ts:%d"
 
 // Merge the incoming state with existing on-disk state
 func (tableState *DeltaTableState[RowType, PartitionType]) mergeOnDiskState(newTableState *DeltaTableState[RowType, PartitionType], maxRowsPerPart int, config *ReadWriteCheckpointConfiguration, finalMerge bool) error {
@@ -58,165 +73,136 @@ func (tableState *DeltaTableState[RowType, PartitionType]) mergeOnDiskState(newT
 		(len(tableState.Files) > 0 && len(newTableState.Tombstones) > 0) ||
 		(len(tableState.Tombstones) > 0 && len(newTableState.Files) > 0) ||
 		(len(tableState.Files)+len(tableState.Tombstones) > maxRowsPerPart) {
-		appended := false
 		defer perf.TrackTime(time.Now(), "mergeOnDiskState")
 
-		mergeSinglePart := func(part int) error {
-			tryAppend := part == len(tableState.onDiskTempFiles)-1
-			didAppend, addsDiff, tombstonesDiff, err := mergeNewAddsAndRemovesToOnDiskPartState(config.WorkingStore, &tableState.onDiskTempFiles[part], tableState.Files, tableState.Tombstones, maxRowsPerPart, tryAppend)
+		findPipeline := tableState.redisClient.Pipeline()
+		deletePipeline := tableState.redisClient.Pipeline()
+		pipelineCount := 0
+
+		processPipelineBatch := func(isOldRemove bool) error {
+			// Retrieve the old values
+			cmders, err := findPipeline.Exec(tableState.ctx)
 			if err != nil {
 				return err
 			}
-			// Only one call to updateOnDiskState() will try to append, so only one (at most) goroutine will set appended here
-			if didAppend {
-				appended = true
+			// Clear out the old values
+			_, err = deletePipeline.Exec(tableState.ctx)
+			if err != nil {
+				return err
 			}
-			// This is threadsafe
-			if addsDiff != 0 || tombstonesDiff != 0 {
-				tableState.updateOnDiskCounts(addsDiff, tombstonesDiff)
+			var oldValidKey string
+			if isOldRemove {
+				oldValidKey = validRemoveKey
+			} else {
+				oldValidKey = validAddKey
 			}
+			// Iterate through the old values
+			for _, cmder := range cmders {
+				result, ok := cmder.(*redis.MapStringStringCmd)
+				if !ok {
+					return fmt.Errorf("unexpected result from redis %v", cmder)
+				}
+				resultMap, err := result.Result()
+				if err != nil {
+					return err
+				}
+				// Clear out old "valid" entries
+				deletePipeline.ZRem(tableState.ctx, oldValidKey, fmt.Sprintf("%s:%s:%s", resultMap["p"], resultMap["r"], resultMap["o"]))
+
+				// TODO check actual value here when true/false
+				if isOldRemove {
+					// Previous action was a remove; update our not extended metadata count
+					if resultMap["e"] == "0" {
+						tableState.notExtCount.Add(-1)
+					}
+					path := strings.TrimPrefix(result.Args()[1].(string), "rem:")
+					deletePipeline.SRem(tableState.ctx, fmt.Sprintf(timestampPathListKeyPattern, resultMap["t"]), path)
+				}
+			}
+			// Clear out old valid keys
+			_, err = deletePipeline.Exec(tableState.ctx)
+			if err != nil {
+				return err
+			}
+			pipelineCount = 0
 			return nil
 		}
-		// Optional concurrency support
-		if config.ConcurrentCheckpointRead > 1 {
-			g, ctx := errgroup.WithContext(context.Background())
-			fileIndexChannel := make(chan int)
 
-			for i := 0; i < config.ConcurrentCheckpointRead; i++ {
-				g.Go(func() error {
-					for part := range fileIndexChannel {
-						err := mergeSinglePart(part)
-						if err != nil {
-							return err
-						}
-					}
-					return nil
-				})
-			}
-			g.Go(func() error {
-				defer close(fileIndexChannel)
-				done := ctx.Done()
-				for i := range tableState.onDiskTempFiles {
-					if err := ctx.Err(); err != nil {
+		if len(tableState.Files) > 0 {
+			for path := range tableState.Files {
+				oppositeKey := fmt.Sprintf(removeKeyPattern, path)
+				findPipeline.HGetAll(tableState.ctx, oppositeKey)
+				deletePipeline.Del(tableState.ctx, oppositeKey)
+				pipelineCount++
+				if pipelineCount >= 10000 {
+					err := processPipelineBatch(true)
+					if err != nil {
 						return err
 					}
-					select {
-					case fileIndexChannel <- i:
-						continue
-					case <-done:
-						break
-					}
 				}
-				return ctx.Err()
-			})
-			err := g.Wait()
-			if err != nil {
-				return err
 			}
-		} else {
-			// non-concurrent
-			for part := range tableState.onDiskTempFiles {
-				err := mergeSinglePart(part)
+			if pipelineCount > 0 {
+				err := processPipelineBatch(true)
 				if err != nil {
 					return err
 				}
 			}
 		}
 
-		if !appended {
-			// Didn't append so create a new file instead
-			exampleRecord, err := newCheckpointEntryRecord[RowType, PartitionType](0)
-			if err != nil {
-				return err
-			}
-			schemaDetails := new(tempFileSchemaDetails)
-			err = schemaDetails.setFromArrowSchema(exampleRecord.Schema(), nil)
-			if err != nil {
-				return err
-			}
-			newRecord, err := newRecordForAddsAndRemoves(tableState.Files, tableState.Tombstones, schemaDetails.addFieldIndex, schemaDetails.removeFieldIndex)
-			if err != nil {
-				return err
-			}
-			defer newRecord.Release()
-			(*schemaDetails).schema = newRecord.Schema()
-
-			onDiskFile := storage.PathFromIter([]string{config.WorkingFolder.Raw, fmt.Sprintf("intermediate.%d.parquet", len(tableState.onDiskTempFiles))})
-			perf.TrackOperationThreadSafe("update.mergeOnDiskState.write")
-			err = writeRecords(config.WorkingStore, &onDiskFile, schemaDetails.schema, []arrow.Record{newRecord})
-			if err != nil {
-				return err
-			}
-			tableState.onDiskTempFiles = append(tableState.onDiskTempFiles, onDiskFile)
-			tableState.updateOnDiskCounts(len(tableState.Files), len(tableState.Tombstones))
-		}
-		// Reset the pending files and tombstones
-		tableState.Files = make(map[string]AddPartitioned[RowType, PartitionType], 10000)
-		tableState.Tombstones = make(map[string]Remove, 10000)
-	}
-	return nil
-}
-
-// Merge new adds and removes with a single on-disk temp file
-func mergeNewAddsAndRemovesToOnDiskPartState[RowType any, PartitionType any](
-	store storage.ObjectStore, path *storage.Path,
-	newAdds map[string]AddPartitioned[RowType, PartitionType], newRemoves map[string]Remove,
-	maxRowsPerPart int, tryAppend bool) (bool, int, int, error) {
-	var addDiffCount, tombstoneDiffCount int
-	appended := false
-
-	getRowsToNull := func(record arrow.Record, arrowSchemaDetails *tempFileSchemaDetails, addRowsToNull *[]int64, removeRowsToNull *[]int64) {
-		addPathArray := record.Column(arrowSchemaDetails.addFieldIndex).(*array.Struct).Field(arrowSchemaDetails.addPathFieldIndex).(*array.String)
-		removePathArray := record.Column(arrowSchemaDetails.removeFieldIndex).(*array.Struct).Field(arrowSchemaDetails.removePathFieldIndex).(*array.String)
-		// Note that although record.NumRows() returns an int64, both the IsNull() and Value() functions accept ints
-		for row := 0; row < int(record.NumRows()); row++ {
-			// Is there an add action in this row
-			if !addPathArray.IsNull(row) {
-				// If the file is now in tombstones, it needs to be removed from the add file list
-				_, ok := newRemoves[addPathArray.Value(row)]
-				if ok {
-					*addRowsToNull = append(*addRowsToNull, int64(row))
+		if len(tableState.Tombstones) > 0 {
+			for path := range tableState.Tombstones {
+				oppositeKey := fmt.Sprintf(addKeyPattern, path)
+				findPipeline.HGetAll(tableState.ctx, oppositeKey)
+				deletePipeline.Del(tableState.ctx, oppositeKey)
+				pipelineCount++
+				if pipelineCount >= 10000 {
+					err := processPipelineBatch(false)
+					if err != nil {
+						return err
+					}
 				}
 			}
-			// Is there a remove action in this row
-			if !removePathArray.IsNull(row) {
-				// If the file has been re-added, it needs to be removed from the tombstones
-				_, ok := newAdds[removePathArray.Value(row)]
-				if ok {
-					*removeRowsToNull = append(*removeRowsToNull, int64(row))
-				}
-			}
-		}
-		addDiffCount -= len(*addRowsToNull)
-		tombstoneDiffCount -= len(*removeRowsToNull)
-	}
-
-	appendRows := func(records *[]arrow.Record, arrowSchemaDetails *tempFileSchemaDetails, rowCount int) (bool, error) {
-		// If we want to write out the new values, see if they fit in this file
-		if tryAppend && (rowCount+len(newAdds)+len(newRemoves) < maxRowsPerPart) {
-			// Existing checkpoint file schema may not match if generated from a different client; check first
-			exampleRecord, err := newCheckpointEntryRecord[RowType, PartitionType](0)
-			if err != nil {
-				return false, err
-			}
-			if exampleRecord.Schema().Equal(arrowSchemaDetails.schema) {
-				// newRecordForAddsAndRemoves returns a retained record, so we don't need to retain it again here
-				newRecord, err := newRecordForAddsAndRemoves(newAdds, newRemoves, arrowSchemaDetails.addFieldIndex, arrowSchemaDetails.removeFieldIndex)
+			if pipelineCount > 0 {
+				err := processPipelineBatch(false)
 				if err != nil {
-					return false, err
+					return err
 				}
-				*records = append(*records, newRecord)
-				addDiffCount += len(newAdds)
-				tombstoneDiffCount += len(newRemoves)
-				appended = true
-				return true, nil
 			}
 		}
-		return false, nil
-	}
 
-	err := updateOnDiskPartState[RowType, PartitionType]("update.mergeNewAddsAndRemovesToOnDiskPartState", store, path, getRowsToNull, appendRows)
-	return appended, addDiffCount, tombstoneDiffCount, err
+		// Create a new record and file, and add the new Redis entries
+		nextPart := int32(len(tableState.onDiskTempFiles))
+
+		exampleRecord, err := newCheckpointEntryRecord[RowType, PartitionType](0)
+		if err != nil {
+			return err
+		}
+		schemaDetails := new(tempFileSchemaDetails)
+		err = schemaDetails.setFromArrowSchema(exampleRecord.Schema(), nil)
+		if err != nil {
+			return err
+		}
+		newRecord, err := newRecordForAddsAndRemoves(tableState.ctx, tableState.redisClient, nextPart, tableState.Files, tableState.Tombstones, schemaDetails.addFieldIndex, schemaDetails.removeFieldIndex)
+		if err != nil {
+			return err
+		}
+		defer newRecord.Release()
+		(*schemaDetails).schema = newRecord.Schema()
+
+		onDiskFile := storage.PathFromIter([]string{config.WorkingFolder.Raw, fmt.Sprintf("intermediate.%d.parquet", nextPart)})
+		perf.TrackOperationThreadSafe("update.mergeOnDiskState.write")
+		err = writeRecords(config.WorkingStore, &onDiskFile, schemaDetails.schema, []arrow.Record{newRecord})
+		if err != nil {
+			return err
+		}
+		tableState.onDiskTempFiles = append(tableState.onDiskTempFiles, onDiskFile)
+		tableState.updateOnDiskCounts(len(tableState.Files), len(tableState.Tombstones))
+	}
+	// Reset the pending files and tombstones
+	tableState.Files = make(map[string]AddPartitioned[RowType, PartitionType], 10000)
+	tableState.Tombstones = make(map[string]Remove, 10000)
+
+	return nil
 }
 
 // Update the on-disk state in the given file with the new adds and removes
@@ -301,45 +287,84 @@ func updateOnDiskPartState[RowType any, PartitionType any](
 	return nil
 }
 
+type addRedis struct {
+	Part   int32 `redis:"p"`
+	Record int32 `redis:"r"`
+	Row    int32 `redis:"o"`
+}
+
+type removeRedis struct {
+	Part      int32 `redis:"p"`
+	Record    int32 `redis:"r"`
+	Row       int32 `redis:"o"`
+	Ext       bool  `redis:"e"`
+	Timestamp int64 `redis:"t"`
+}
+
 // Count the adds and tombstones in a checkpoint file and add them to the state total
-func countAddsAndTombstones[RowType any, PartitionType any](tableState *DeltaTableState[RowType, PartitionType], checkpointBytes []byte, arrowSchema *arrow.Schema, config *ReadWriteCheckpointConfiguration) error {
-	perf.SnapshotMemory("countAddsAndTombstones beginning")
+func initializeOnDiskRecord[RowType any, PartitionType any](tableState *DeltaTableState[RowType, PartitionType], record arrow.Record, recordNumber int, part int32, arrowSchema *arrow.Schema) error {
+	perf.SnapshotMemory("initializeOnDiskRecord beginning")
+	defer perf.TrackTime(time.Now(), "initializeOnDiskRecord")
 
 	arrowSchemaDetails := new(tempFileSchemaDetails)
 	err := arrowSchemaDetails.setFromArrowSchema(arrowSchema, nil)
 	if err != nil {
 		return err
 	}
+	addPathArray := record.Column(arrowSchemaDetails.addFieldIndex).(*array.Struct).Field(arrowSchemaDetails.addPathFieldIndex).(*array.String)
+	removeArray := record.Column(arrowSchemaDetails.removeFieldIndex).(*array.Struct)
+	removePathArray := removeArray.Field(arrowSchemaDetails.removePathFieldIndex).(*array.String)
+	removeExtendedFileMetadataArray := removeArray.Field(arrowSchemaDetails.removeExtendedFileMetadataIndex).(*array.Boolean)
+	removeTimestampArray := removeArray.Field(arrowSchemaDetails.removeDeletionTimestampIndex).(*array.Int64)
+	addCount := addPathArray.Len() - addPathArray.NullN()
+	removeCount := removePathArray.Len() - removePathArray.NullN()
+	tableState.updateOnDiskCounts(addCount, removeCount)
 
-	bytesReader := bytes.NewReader(checkpointBytes)
-	parquetReader, err := file.NewParquetReader(bytesReader)
-	if err != nil {
-		return err
+	pipe := tableState.redisClient.Pipeline()
+	pipeCount := 0
+	// Note that although record.NumRows() returns an int64, both the IsNull() and Value() functions accept ints
+	for row := 0; row < int(record.NumRows()); row++ {
+		// Is there an add action in this row
+		if !addPathArray.IsNull(row) {
+			pipe.HSet(tableState.ctx, fmt.Sprintf(addKeyPattern, addPathArray.Value(row)), addRedis{Part: part, Record: int32(recordNumber), Row: int32(row)})
+			pipe.ZAdd(tableState.ctx, validAddKey, redis.Z{Score: float64(part), Member: fmt.Sprintf("%d:%d:%d", part, recordNumber, row)})
+			pipeCount += 2
+		}
+		// Is there a remove action in this row
+		if !removePathArray.IsNull(row) {
+			ext := removeExtendedFileMetadataArray.Value(row)
+			timestamp := removeTimestampArray.Value(row)
+			path := removePathArray.Value(row)
+			pipe.HSet(tableState.ctx, fmt.Sprintf(removeKeyPattern, path), removeRedis{Part: part, Record: int32(recordNumber), Row: int32(row), Ext: ext, Timestamp: timestamp})
+			pipe.ZAdd(tableState.ctx, validRemoveKey, redis.Z{Score: float64(part), Member: fmt.Sprintf("%d:%d:%d", part, recordNumber, row)})
+			pipe.SAdd(tableState.ctx, timestampListKey, timestamp)
+			pipe.SAdd(tableState.ctx, fmt.Sprintf(timestampIntPathListKeyPattern, timestamp), path)
+			if !ext {
+				tableState.notExtCount.Add(1)
+			}
+			pipeCount += 4
+		}
+		if pipeCount >= 10000 {
+			cmders, err := pipe.Exec(tableState.ctx)
+			for _, cmder := range cmders {
+				if cmder.Err() != nil {
+					log.Print(cmder.Err())
+				}
+			}
+			if err != nil {
+				return err
+			}
+			pipeCount = 0
+		}
 	}
-	defer parquetReader.Close()
-	arrowRdr, err := pqarrow.NewFileReader(parquetReader, pqarrow.ArrowReadProperties{Parallel: true, BatchSize: 10}, memory.DefaultAllocator)
-	if err != nil {
-		return err
+	if pipeCount > 0 {
+		_, err := pipe.Exec(tableState.ctx)
+		if err != nil {
+			return err
+		}
 	}
 
-	tbl, err := arrowRdr.ReadTable(context.TODO())
-	if err != nil {
-		return err
-	}
-	defer tbl.Release()
-
-	tableReader := array.NewTableReader(tbl, 0)
-	defer tableReader.Release()
-
-	rowCount := 0
-	for tableReader.Next() {
-		record := tableReader.Record()
-		rowCount += int(record.NumRows())
-		addPathArray := record.Column(arrowSchemaDetails.addFieldIndex).(*array.Struct).Field(arrowSchemaDetails.addPathFieldIndex).(*array.String)
-		removePathArray := record.Column(arrowSchemaDetails.removeFieldIndex).(*array.Struct).Field(arrowSchemaDetails.removePathFieldIndex).(*array.String)
-		tableState.updateOnDiskCounts(addPathArray.Len()-addPathArray.NullN(), removePathArray.Len()-removePathArray.NullN())
-	}
-	perf.SnapshotMemory("countAddsAndTombstones end")
+	perf.SnapshotMemory("initializeOnDiskRecord end")
 	return nil
 }
 
@@ -408,17 +433,33 @@ func (details *tempFileSchemaDetails) setFromArrowSchema(arrowSchema *arrow.Sche
 
 // Get a new record containing the adds and removes
 // The record returned needs to be released
-func newRecordForAddsAndRemoves[RowType any, PartitionType any](newAdds map[string]AddPartitioned[RowType, PartitionType], newRemoves map[string]Remove, addFieldIndex int, removeFieldIndex int) (arrow.Record, error) {
+func newRecordForAddsAndRemoves[RowType any, PartitionType any](ctx context.Context, redisClient redis.UniversalClient, nextPart int32, newAdds map[string]AddPartitioned[RowType, PartitionType], newRemoves map[string]Remove, addFieldIndex int, removeFieldIndex int) (arrow.Record, error) {
+	addPipeline := redisClient.Pipeline()
 	newRecord, err := newCheckpointEntryRecord[RowType, PartitionType](len(newAdds) + len(newRemoves))
 	if err != nil {
 		return nil, err
 	}
+
+	applyAdds := func() error {
+		_, err := addPipeline.Exec(ctx)
+		return err
+	}
+
 	if len(newAdds) > 0 {
 		addsSlice := make([]AddPartitioned[RowType, PartitionType], len(newAdds))
 		i := 0
-		for _, ap := range newAdds {
+		for path, ap := range newAdds {
+			addPipeline.HSet(ctx, fmt.Sprintf(addKeyPattern, path), addRedis{Part: nextPart, Record: 0, Row: int32(i)})
+			addPipeline.ZAdd(ctx, validAddKey, redis.Z{Score: float64(nextPart), Member: fmt.Sprintf("%d:%d:%d", nextPart, 0, i)})
 			addsSlice[i] = ap
 			i++
+
+			if addPipeline.Len() >= 10000 {
+				err := applyAdds()
+				if err != nil {
+					return nil, err
+				}
+			}
 		}
 		newAddsArray, err := newColumnArray(addsSlice, 0, len(newRemoves))
 		defer newAddsArray.Release()
@@ -430,12 +471,25 @@ func newRecordForAddsAndRemoves[RowType any, PartitionType any](newAdds map[stri
 			return nil, err
 		}
 	}
+	offset := int32(len(newAdds))
 	if len(newRemoves) > 0 {
 		removesSlice := make([]Remove, len(newRemoves))
 		i := 0
-		for _, r := range newRemoves {
+		for path, r := range newRemoves {
+			addPipeline.HSet(ctx, fmt.Sprintf(removeKeyPattern, path), removeRedis{Part: nextPart, Record: 0, Row: int32(i) + offset, Ext: r.ExtendedFileMetadata, Timestamp: *r.DeletionTimestamp})
+			addPipeline.ZAdd(ctx, validRemoveKey, redis.Z{Score: float64(nextPart), Member: fmt.Sprintf("%d:%d:%d", nextPart, 0, i)})
+			addPipeline.SAdd(ctx, timestampListKey, *r.DeletionTimestamp)
+			addPipeline.SAdd(ctx, fmt.Sprintf(timestampIntPathListKeyPattern, *r.DeletionTimestamp), path)
+
 			removesSlice[i] = r
 			i++
+
+			if addPipeline.Len() >= 10000 {
+				err := applyAdds()
+				if err != nil {
+					return nil, err
+				}
+			}
 		}
 		newRemovesArray, err := newColumnArray(removesSlice, len(newAdds), 0)
 		defer newRemovesArray.Release()
@@ -443,6 +497,12 @@ func newRecordForAddsAndRemoves[RowType any, PartitionType any](newAdds map[stri
 			return nil, err
 		}
 		newRecord, err = newRecord.SetColumn(removeFieldIndex, newRemovesArray)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if addPipeline.Len() > 0 {
+		err := applyAdds()
 		if err != nil {
 			return nil, err
 		}
@@ -642,6 +702,11 @@ func (tableState *DeltaTableState[RowType, PartitionType]) prepareOnDiskStateFor
 		}
 	}
 	return nil
+}
+
+func prepareTombstonesForCheckpoint[RowType any, PartitionType any](tableState *DeltaTableState[RowType, PartitionType]) {
+	iter := uint64(0)
+	tableState.redisClient.Scan(tableState.ctx, iter, "rem:*", 10000)
 }
 
 // Find out whether there are any non-extended metadata tombstones and null out any expired tombstones
