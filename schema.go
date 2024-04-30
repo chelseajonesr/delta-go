@@ -399,12 +399,22 @@ func GetSchema(i any) SchemaTypeStruct {
 				recursiveStruct := GetSchema(fieldInterface)
 				field = SchemaField{Name: name, Type: SchemaTypeStruct{Type: Struct, Fields: recursiveStruct.Fields}, Nullable: nullable, Metadata: emptyMetaData}
 
-			default:
-				fieldPointer := reflect.New(structField.Type)
-				fieldInterface := fieldPointer.Interface()
-				schemaDataType := getFieldDataType(fieldInterface)
-				field = SchemaField{Name: name, Type: schemaDataType, Nullable: nullable, Metadata: emptyMetaData}
+			case reflect.Map:
+				schemaKeyType := getFieldDataType(structField.Type.Key())
+				schemaDataType := getFieldDataType(structField.Type.Elem())
+				field = SchemaField{Name: name, Type: SchemaTypeMap{Type: Map, KeyType: schemaKeyType, ValueType: schemaDataType, ValueContainsNull: nullable}, Nullable: nullable, Metadata: emptyMetaData}
 
+			case reflect.Slice:
+				schemaDataType := getFieldDataType(structField.Type.Elem())
+				if schemaDataType == Byte {
+					field = SchemaField{Name: name, Type: Binary, Nullable: nullable, Metadata: emptyMetaData}
+				} else {
+					field = SchemaField{Name: name, Type: SchemaTypeArray{Type: Array, ElementType: schemaDataType, ContainsNull: nullable}, Nullable: nullable, Metadata: emptyMetaData}
+				}
+
+			default:
+				schemaDataType := getFieldDataType(structField.Type)
+				field = SchemaField{Name: name, Type: schemaDataType, Nullable: nullable, Metadata: emptyMetaData}
 			}
 		}
 		fields = append(fields, field)
@@ -413,20 +423,26 @@ func GetSchema(i any) SchemaTypeStruct {
 	return SchemaTypeStruct{Type: Struct, Fields: fields}
 }
 
-func getFieldDataType(t any) SchemaDataTypeName {
+func getFieldDataType(r reflect.Type) SchemaDataTypeName {
+	for r.Kind() == reflect.Ptr {
+		r = r.Elem()
+	}
+	ptr := reflect.New(r)
+	t := ptr.Interface()
+
 	switch t.(type) {
-	case string:
+	case *string:
 		return String
 	case *[]byte:
 		return Binary
-	case []byte:
-		return Binary
-	case time.Time:
+	case *time.Time:
 		return Timestamp
-	case int64:
+	case *int64:
 		return Long
-	case int:
+	case *int:
 		return Integer
+	case *byte:
+		return Byte
 	default:
 		return String
 	}

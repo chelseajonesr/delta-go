@@ -58,10 +58,12 @@ func TestGetSchema(t *testing.T) {
 
 }
 
-func TestGetSchemaWithWeirdTypes(t *testing.T) {
+func TestGetSchemaAdditionalTypes(t *testing.T) {
 	type RowType struct {
-		Bin       []byte `parquet:"bin,snappy"`
-		Timestamp int64  `parquet:"timestamp,snappy" type:"timestamp"`
+		Bin       []byte         `parquet:"bin,snappy"`
+		Timestamp int64          `parquet:"timestamp,snappy" type:"timestamp"`
+		StringMap map[string]int `parquet:"string_map"`
+		LongSlice []*int64       `parquet:"long_slice"`
 	}
 
 	schema := GetSchema(new(RowType))
@@ -83,7 +85,7 @@ func TestGetSchemaWithWeirdTypes(t *testing.T) {
 	b := schema.JSON()
 	schemaString := string(b)
 	fmt.Println(schemaString)
-	expectedStr := `{"type":"struct","fields":[{"name":"bin","type":"binary","nullable":true,"metadata":{}},{"name":"timestamp","type":"timestamp","nullable":true,"metadata":{}}]}`
+	expectedStr := `{"type":"struct","fields":[{"name":"bin","type":"binary","nullable":true,"metadata":{}},{"name":"timestamp","type":"timestamp","nullable":true,"metadata":{}},{"name":"string_map","type":{"type":"map","keyType":"string","valueType":"integer","valueContainsNull":true},"nullable":true,"metadata":{}},{"name":"long_slice","type":{"type":"array","elementType":"long","containsNull":true},"nullable":true,"metadata":{}}]}`
 	if schemaString != expectedStr {
 		t.Errorf("has:\n%s\nwant:\n%s", schemaString, expectedStr)
 	}
