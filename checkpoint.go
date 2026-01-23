@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -512,4 +513,322 @@ func removeExpiredLogsAndCheckpoints(beforeVersion int64, maxTimestamp time.Time
 		}
 		lastFile = currentFile
 	}
+}
+
+// createFilteredCheckpointFor filters a checkpoint by removing Add/Remove actions with partition values
+// less than the minimum value for the specified partition key, and creates a new checkpoint at the next version.
+// This is an internal helper function called by Table.CreateFilteredCheckpoint.
+// Assumes validation has already been done by the caller.
+// Processes one checkpoint part at a time to minimize memory usage.
+func createFilteredCheckpointFor(
+	table *Table,
+	version int64,
+	partitionKey string,
+	minPartitionValue string,
+) error {
+	// Load checkpoint metadata
+	checkpoint, err := loadCheckpointMetadataForVersion(table, version)
+	if err != nil {
+		return err
+	}
+
+	checkpointDataPaths := table.GetCheckpointDataPaths(checkpoint)
+	newVersion := version + 1
+
+	// Process parts one at a time to minimize memory usage
+	var latestMetadata *MetaData
+	var totalBytes int64
+	var totalEntries int64
+	var numAddFiles int64
+	tmpPartPaths := make([]storage.Path, 0, len(checkpointDataPaths))
+	nonEmptyPartCount := 0
+
+	for partIndex, checkpointPath := range checkpointDataPaths {
+		// Process single part: read, filter, write
+		filteredEntries, metadata, addCount, err := processAndFilterCheckpointPart(
+			table, checkpointPath, version, partIndex, partitionKey, minPartitionValue)
+		if err != nil {
+			return err
+		}
+
+		// Track latest metadata
+		if metadata != nil {
+			latestMetadata = metadata
+		}
+
+		// Skip empty parts
+		if len(filteredEntries) == 0 {
+			continue
+		}
+
+		numAddFiles += addCount
+
+		// Write this part to .tmp immediately
+		tmpPath, partBytes, err := writeCheckpointPartToTmp(
+			table, newVersion, nonEmptyPartCount, filteredEntries)
+		if err != nil {
+			return err
+		}
+
+		tmpPartPaths = append(tmpPartPaths, tmpPath)
+		totalBytes += partBytes
+		totalEntries += int64(len(filteredEntries))
+		nonEmptyPartCount++
+	}
+
+	if latestMetadata == nil {
+		return errors.Join(ErrMissingMetadata, errors.New("no metadata found in checkpoint"))
+	}
+
+	// Finalize: create commit file, move parts, write _last_checkpoint
+	return finalizeFilteredCheckpoint(table, newVersion, tmpPartPaths, latestMetadata, totalEntries, totalBytes, numAddFiles)
+}
+
+// loadCheckpointMetadataForVersion loads checkpoint metadata for the specified version.
+func loadCheckpointMetadataForVersion(table *Table, version int64) (*CheckPoint, error) {
+	// Try to get from _last_checkpoint first
+	var checkpoint *CheckPoint
+	checkpointBytes, err := table.Store.Get(lastCheckpointPath())
+	if err == nil {
+		lastCheckpoint, err := checkpointFromBytes(checkpointBytes)
+		if err == nil && lastCheckpoint.Version == version {
+			checkpoint = lastCheckpoint
+		}
+	}
+
+	// If not found in _last_checkpoint, try to find by listing files
+	if checkpoint == nil {
+		str := fmt.Sprintf("%020d", version)
+		path := storage.PathFromIter([]string{"_delta_log", str})
+		possibleCheckpointFiles, err := table.Store.ListAll(path)
+		if err != nil {
+			return nil, errors.Join(errors.New("failed to list checkpoint files"), err)
+		}
+
+		// Find all checkpoint parts
+		partsFound := make(map[int32]bool, 10)
+		var totalParts int32
+		for _, possibleCheckpointFile := range possibleCheckpointFiles.Objects {
+			checkpointInfo, currentPart, err := checkpointInfoFromURI(possibleCheckpointFile.Location)
+			if err != nil {
+				return nil, err
+			}
+			if checkpointInfo != nil && checkpointInfo.Version == version {
+				if checkpointInfo.Parts != nil {
+					if totalParts > 0 && *checkpointInfo.Parts != totalParts {
+						return nil, errors.Join(ErrCheckpointInvalidMultipartFileName, fmt.Errorf("different number of total parts found between checkpoint files for version %d", version))
+					}
+					totalParts = *checkpointInfo.Parts
+					partsFound[currentPart] = true
+				} else {
+					// Single part checkpoint
+					checkpoint = checkpointInfo
+					break
+				}
+			}
+		}
+
+		// If multi-part, construct checkpoint metadata
+		if totalParts > 0 {
+			checkpoint = &CheckPoint{
+				Version: version,
+				Parts:   &totalParts,
+			}
+		} else if checkpoint == nil {
+			// Fallback: assume single part
+			checkpoint = &CheckPoint{Version: version}
+		}
+	}
+
+	checkpointDataPaths := table.GetCheckpointDataPaths(checkpoint)
+	if len(checkpointDataPaths) == 0 {
+		return nil, errors.Join(ErrCheckpointIncomplete, fmt.Errorf("no checkpoint paths found for version %d", version))
+	}
+
+	return checkpoint, nil
+}
+
+// processAndFilterCheckpointPart processes a single checkpoint part: reads it, filters by partition value.
+// Returns filtered entries, metadata (if found), and count of Add actions.
+// This processes one part at a time to minimize memory usage.
+// Filters CheckpointEntry values directly without converting to/from TableState.
+func processAndFilterCheckpointPart(
+	table *Table,
+	checkpointPath storage.Path,
+	version int64,
+	partIndex int,
+	partitionKey string,
+	minPartitionValue string,
+) ([]CheckpointEntry, *MetaData, int64, error) {
+	// Read checkpoint part as raw CheckpointEntry values
+	checkpointBytes, err := table.Store.Get(checkpointPath)
+	if err != nil {
+		return nil, nil, 0, errors.Join(fmt.Errorf("failed to read checkpoint part %d", partIndex), err)
+	}
+	if len(checkpointBytes) == 0 {
+		return nil, nil, 0, errors.Join(ErrCheckpointIncomplete, fmt.Errorf("zero size checkpoint at %s", checkpointPath.Raw))
+	}
+
+	entries, _, err := readCheckpointEntriesFromBytes(checkpointBytes)
+	if err != nil {
+		return nil, nil, 0, errors.Join(fmt.Errorf("failed to parse checkpoint part %d", partIndex), err)
+	}
+
+	// Filter entries directly
+	filteredEntries := make([]CheckpointEntry, 0, len(entries))
+	var metadata *MetaData
+	var numAddFiles int64
+
+	for _, entry := range entries {
+		shouldInclude := true
+
+		// Track latest metadata
+		if entry.MetaData != nil {
+			metadata = entry.MetaData
+		}
+
+		// Filter Add actions by partition value
+		if entry.Add != nil {
+			partitionValue, exists := entry.Add.PartitionValues[partitionKey]
+			if exists && strings.Compare(partitionValue, minPartitionValue) < 0 {
+				shouldInclude = false
+			} else if shouldInclude {
+				numAddFiles++
+			}
+		}
+
+		// Filter Remove actions by partition value
+		if entry.Remove != nil {
+			if entry.Remove.PartitionValues != nil {
+				partitionValue, exists := (*entry.Remove.PartitionValues)[partitionKey]
+				if exists && strings.Compare(partitionValue, minPartitionValue) < 0 {
+					shouldInclude = false
+				}
+			}
+		}
+
+		// Keep Protocol, MetaData, Txn entries, and filtered Add/Remove
+		if shouldInclude {
+			filteredEntries = append(filteredEntries, entry)
+		}
+	}
+
+	return filteredEntries, metadata, numAddFiles, nil
+}
+
+// writeCheckpointPartToTmp writes a single checkpoint part to the .tmp folder.
+// Returns the tmp path and the size in bytes.
+func writeCheckpointPartToTmp(
+	table *Table,
+	newVersion int64,
+	partIndex int,
+	filteredEntries []CheckpointEntry,
+) (storage.Path, int64, error) {
+	// We don't know the final part count yet, so use a placeholder
+	// The filename will be corrected when we move from .tmp to final location
+	checkpointFileName := fmt.Sprintf("%020d.checkpoint.part%d.parquet", newVersion, partIndex)
+	tmpPath := storage.PathFromIter([]string{"_delta_log", ".tmp", checkpointFileName})
+
+	// Write Parquet file
+	buf := new(bytes.Buffer)
+	props := parquet.NewWriterProperties(
+		parquet.WithCompression(compress.Codecs.Snappy),
+	)
+	err := rfarrow.WriteGoStructsToParquet(filteredEntries, buf, props)
+	if err != nil {
+		return storage.Path{}, 0, errors.Join(fmt.Errorf("failed to write checkpoint part %d", partIndex), err)
+	}
+	parquetBytes := buf.Bytes()
+
+	err = table.Store.Put(tmpPath, parquetBytes)
+	if err != nil {
+		return storage.Path{}, 0, errors.Join(fmt.Errorf("failed to write temporary checkpoint part %d", partIndex), err)
+	}
+
+	return tmpPath, int64(len(parquetBytes)), nil
+}
+
+// finalizeFilteredCheckpoint creates commit file, moves parts from .tmp, and writes _last_checkpoint.
+func finalizeFilteredCheckpoint(
+	table *Table,
+	newVersion int64,
+	tmpPartPaths []storage.Path,
+	metadata *MetaData,
+	totalEntries int64,
+	totalBytes int64,
+	numAddFiles int64,
+) error {
+	var err error
+
+	// Create commit file using LogStore if available
+	commitActions := []Action{metadata}
+	
+	if table.LogStore != nil {
+		// Use the log store protocol for proper coordination
+		transaction := table.CreateTransaction(NewTransactionOptions())
+		transaction.AddActions(commitActions)
+		
+		committedVersion, err := transaction.commitAtVersionLogStore(newVersion)
+		if err != nil {
+			return errors.Join(fmt.Errorf("failed to commit version %d through log store", newVersion), err)
+		}
+		if committedVersion != newVersion {
+			return fmt.Errorf("committed version %d does not match expected version %d", committedVersion, newVersion)
+		}
+	} else {
+		// No log store - write commit file directly
+		commitBytes, err := LogEntryFromActions(commitActions)
+		if err != nil {
+			return errors.Join(errors.New("failed to serialize commit actions"), err)
+		}
+		commitPath := CommitURIFromVersion(newVersion)
+		err = table.Store.Put(commitPath, commitBytes)
+		if err != nil {
+			return errors.Join(fmt.Errorf("failed to write commit file for version %d", newVersion), err)
+		}
+	}
+
+	// Move checkpoint parts from .tmp to final location with correct names
+	renamedFinalPaths := make([]storage.Path, 0, len(tmpPartPaths))
+	for i, tmpPath := range tmpPartPaths {
+		var finalCheckpointFileName string
+		newPartNum := i + 1
+		if len(tmpPartPaths) == 1 {
+			finalCheckpointFileName = fmt.Sprintf("%020d.checkpoint.parquet", newVersion)
+		} else {
+			finalCheckpointFileName = fmt.Sprintf("%020d.checkpoint.%010d.%010d.parquet", newVersion, newPartNum, len(tmpPartPaths))
+		}
+		finalPath := storage.PathFromIter([]string{"_delta_log", finalCheckpointFileName})
+		renamedFinalPaths = append(renamedFinalPaths, finalPath)
+
+		err = table.Store.RenameIfNotExists(tmpPath, finalPath)
+		if err != nil {
+			return errors.Join(fmt.Errorf("failed to move checkpoint part %d from tmp to final location", i), err)
+		}
+	}
+
+	// Write _last_checkpoint file
+	var reportedParts *int32
+	if len(renamedFinalPaths) > 1 {
+		parts := int32(len(renamedFinalPaths))
+		reportedParts = &parts
+	}
+
+	newCheckpoint := CheckPoint{
+		Version:       newVersion,
+		Size:          totalEntries,
+		SizeInBytes:   totalBytes,
+		Parts:         reportedParts,
+		NumOfAddFiles: numAddFiles,
+	}
+	checkpointBytes, err := json.Marshal(newCheckpoint)
+	if err != nil {
+		return errors.Join(errors.New("failed to marshal checkpoint"), err)
+	}
+	err = table.Store.Put(lastCheckpointPath(), checkpointBytes)
+	if err != nil {
+		return errors.Join(errors.New("failed to write _last_checkpoint file"), err)
+	}
+
+	return nil
 }

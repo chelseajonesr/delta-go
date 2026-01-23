@@ -704,6 +704,32 @@ func (t *Table) CreateCheckpoint(checkpointLock lock.Locker, checkpointConfigura
 	return CreateCheckpoint(t.Store, checkpointLock, checkpointConfiguration, version)
 }
 
+// CreateFilteredCheckpoint creates a new checkpoint at version+1 by filtering the checkpoint at the specified version.
+// It removes Add and Remove actions where the partition value for the given partition key is less than the minimum value.
+// The version must be the latest version in the table, and a complete checkpoint must exist at that version.
+// A new commit file is created at version+1 containing the metadata from the original checkpoint.
+func (t *Table) CreateFilteredCheckpoint(version int64, partitionKey string, minPartitionValue string) error {
+	// Verify checkpoint exists at the specified version
+	checkpointExists, err := DoesCheckpointVersionExist(t.Store, version, true)
+	if err != nil {
+		return errors.Join(errors.New("failed to check if checkpoint exists"), err)
+	}
+	if !checkpointExists {
+		return errors.Join(ErrCheckpointIncomplete, fmt.Errorf("checkpoint does not exist at version %d", version))
+	}
+
+	// Verify the version is the last version in the table
+	latestVersion, err := t.LatestVersion()
+	if err != nil {
+		return errors.Join(errors.New("failed to get latest version"), err)
+	}
+	if latestVersion != version {
+		return errors.Join(ErrInvalidVersion, fmt.Errorf("version %d is not the latest version (latest is %d)", version, latestVersion))
+	}
+
+	return createFilteredCheckpointFor(t, version, partitionKey, minPartitionValue)
+}
+
 // CreateCheckpoint creates a checkpoint for a table located at the store for the given version
 // If expired log cleanup is enabled on this table, then after a successful checkpoint, run the cleanup to delete expired logs
 // Returns whether the checkpoint was created and any error
@@ -964,6 +990,19 @@ func (t *Transaction) tryCommitLogStore() (version int64, err error) {
 		currURI = CommitURIFromVersion(prevVersion + 1)
 	}
 
+	parsed, currVersion := CommitVersionFromURI(currURI)
+	if !parsed {
+		return -1, fmt.Errorf("failed to parse current version from %s", currURI.Raw)
+	}
+
+	return t.commitAtVersionLogStore(currVersion)
+}
+
+// commitAtVersionLogStore commits actions at a specific version using the log store protocol.
+// This is used when the version is predetermined (e.g., for filtered checkpoints).
+func (t *Transaction) commitAtVersionLogStore(currVersion int64) (version int64, err error) {
+	currURI := CommitURIFromVersion(currVersion)
+
 	t.addCommitInfoIfNotPresent()
 
 	// Prevent concurrent writers from checking if N-1.json exists and performing a recovery
@@ -986,11 +1025,6 @@ func (t *Transaction) tryCommitLogStore() (version int64, err error) {
 	}()
 
 	fileName := storage.NewPath(strings.Split(currURI.Raw, "_delta_log/")[1])
-
-	parsed, currVersion := CommitVersionFromURI(currURI)
-	if !parsed {
-		return -1, fmt.Errorf("failed to parse previous version from %s", currURI.Raw)
-	}
 
 	// Step 0: Fail if N.json already exists in the file system.
 	if _, err = t.Table.Store.Head(currURI); err == nil {

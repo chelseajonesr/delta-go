@@ -331,6 +331,97 @@ func stateFromCheckpointPart(task checkpointProcessingTask) error {
 	return nil
 }
 
+// processCheckpointEntriesFromBytes reads CheckpointEntry records from a checkpoint Parquet file
+// and processes each entry with the provided callback function.
+// fieldExclusions can be used to skip reading certain fields (e.g., ["Add", "Remove"] for on-disk optimization).
+// If columnFilter is provided, only specified columns will be read from the Parquet file.
+// Returns the Arrow schema from the Parquet file.
+func processCheckpointEntriesFromBytes(
+	checkpointBytes []byte,
+	fieldExclusions []string,
+	columnFilter []int,
+	processEntry func(*CheckpointEntry) error,
+) (*arrow.Schema, error) {
+	bytesReader := bytes.NewReader(checkpointBytes)
+	parquetReader, err := file.NewParquetReader(bytesReader)
+	if err != nil {
+		return nil, err
+	}
+	defer parquetReader.Close()
+
+	fileReader, err := pqarrow.NewFileReader(parquetReader, pqarrow.ArrowReadProperties{BatchSize: 10, Parallel: true}, memory.DefaultAllocator)
+	if err != nil {
+		return nil, err
+	}
+	arrowSchema, err := fileReader.Schema()
+	if err != nil {
+		return nil, err
+	}
+	arrowFieldList := arrowSchema.Fields()
+
+	inMemoryIndexMappings, err := rfarrow.MapGoStructFieldNamesToArrowIndices[CheckpointEntry](arrowFieldList, fieldExclusions, true, true)
+	if err != nil {
+		return nil, err
+	}
+
+	// Read table - either all columns or filtered columns
+	var tbl arrow.Table
+	if columnFilter != nil {
+		// Read specific columns from all row groups
+		rgs := make([]int, parquetReader.NumRowGroups())
+		for i := 0; i < parquetReader.NumRowGroups(); i++ {
+			rgs[i] = i
+		}
+		tbl, err = fileReader.ReadRowGroups(context.Background(), columnFilter, rgs)
+	} else {
+		tbl, err = fileReader.ReadTable(context.Background())
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer tbl.Release()
+
+	tableReader := array.NewTableReader(tbl, 0)
+	defer tableReader.Release()
+
+	for tableReader.Next() {
+		record := tableReader.Record()
+
+		batchEntries := make([]*CheckpointEntry, record.NumRows())
+		entryValues := make([]reflect.Value, record.NumRows())
+		for j := int64(0); j < record.NumRows(); j++ {
+			t := new(CheckpointEntry)
+			batchEntries[j] = t
+			entryValues[j] = reflect.ValueOf(t)
+		}
+
+		err = rfarrow.SetGoStructsFromArrowArrays(entryValues, record.Columns(), inMemoryIndexMappings, 0)
+		if err != nil {
+			return nil, err
+		}
+
+		for j := int64(0); j < record.NumRows(); j++ {
+			if err := processEntry(batchEntries[j]); err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	return arrowSchema, nil
+}
+
+// readCheckpointEntriesFromBytes reads CheckpointEntry records from a checkpoint Parquet file.
+// This is a convenience wrapper around processCheckpointEntriesFromBytes that collects all entries.
+// Returns the entries and the Arrow schema from the Parquet file.
+func readCheckpointEntriesFromBytes(checkpointBytes []byte) ([]CheckpointEntry, *arrow.Schema, error) {
+	entries := make([]CheckpointEntry, 0)
+	schema, err := processCheckpointEntriesFromBytes(checkpointBytes, nil, nil, func(entry *CheckpointEntry) error {
+		entries = append(entries, *entry)
+		return nil
+	})
+	return entries, schema, err
+}
+
 func actionFromCheckpointEntry(checkpointEntry *CheckpointEntry) (Action, error) {
 	var action Action
 	if checkpointEntry.Add != nil {
@@ -364,8 +455,9 @@ func actionFromCheckpointEntry(checkpointEntry *CheckpointEntry) (Action, error)
 }
 
 func (tableState *TableState) processCheckpointBytes(checkpointBytes []byte, part int, config *OptimizeCheckpointConfiguration) (returnErr error) {
-	concurrentCheckpointRead := tableState.onDiskOptimization && config.ConcurrentCheckpointRead > 1
-	var processEntryAction = func(checkpointEntry *CheckpointEntry) error {
+	// Callback to process each checkpoint entry and apply it to state
+	concurrentCheckpointRead := tableState.onDiskOptimization && config != nil && config.ConcurrentCheckpointRead > 1
+	processEntryAction := func(checkpointEntry *CheckpointEntry) error {
 		action, err := actionFromCheckpointEntry(checkpointEntry)
 		if err != nil {
 			return err
@@ -389,92 +481,40 @@ func (tableState *TableState) processCheckpointBytes(checkpointBytes []byte, par
 		return nil
 	}
 
-	bytesReader := bytes.NewReader(checkpointBytes)
-	parquetReader, err := file.NewParquetReader(bytesReader)
-	if err != nil {
-		return err
-	}
-	defer func() {
-		if err := parquetReader.Close(); err != nil {
-			returnErr = errors.Join(errors.New("failed to close Parquet reader"), err)
-		}
-	}()
-
-	parquetSchema := parquetReader.MetaData().Schema
-	fileReader, err := pqarrow.NewFileReader(parquetReader, pqarrow.ArrowReadProperties{BatchSize: 10, Parallel: true}, memory.DefaultAllocator)
-	if err != nil {
-		return err
-	}
-	arrowSchema, err := fileReader.Schema()
-	if err != nil {
-		return err
-	}
-	arrowFieldList := arrowSchema.Fields()
-
-	// For on-disk optimization, don't load add/remove into memory
-	inMemoryCols := make([]int, 0, 150)
-	for i := 0; i < parquetSchema.NumColumns(); i++ {
-		columnPath := parquetSchema.Column(i).ColumnPath().String()
-		if !tableState.onDiskOptimization || (!strings.HasPrefix(columnPath, "add") && !strings.HasPrefix(columnPath, "remove")) {
-			inMemoryCols = append(inMemoryCols, i)
-		}
-	}
-
-	// Get mappings between struct member names and parquet/arrow names so we don't have to look them up repeatedly
-	// during record assignments
+	// Determine field exclusions and column filter based on optimization settings
 	var fieldExclusions []string
+	var columnFilter []int
+
 	if tableState.onDiskOptimization {
+		// Skip Add/Remove fields and columns
 		fieldExclusions = []string{"Add", "Remove"}
-	}
-	inMemoryIndexMappings, err := rfarrow.MapGoStructFieldNamesToArrowIndices[CheckpointEntry](arrowFieldList, fieldExclusions, true, true)
-	if err != nil {
-		return err
-	}
 
-	// Read all row groups and process in-memory actions
-	var tbl arrow.Table
-	if tableState.onDiskOptimization {
-		rgs := []int{}
-		for i := 0; i < parquetReader.NumRowGroups(); i++ {
-			rgs = append(rgs, i)
-		}
-		tbl, err = fileReader.ReadRowGroups(context.Background(), inMemoryCols, rgs)
-	} else {
-		tbl, err = fileReader.ReadTable(context.Background())
-	}
-	if err != nil {
-		return err
-	}
-	defer tbl.Release()
-
-	tableReader := array.NewTableReader(tbl, 0)
-	defer tableReader.Release()
-
-	for tableReader.Next() {
-		// the record contains a batch of rows
-		record := tableReader.Record()
-
-		entries := make([]*CheckpointEntry, record.NumRows())
-		entryValues := make([]reflect.Value, record.NumRows())
-		for j := int64(0); j < record.NumRows(); j++ {
-			t := new(CheckpointEntry)
-			entries[j] = t
-			entryValues[j] = reflect.ValueOf(t)
-		}
-
-		err = rfarrow.SetGoStructsFromArrowArrays(entryValues, record.Columns(), inMemoryIndexMappings, 0)
+		// Build column filter to exclude Add/Remove columns
+		bytesReader := bytes.NewReader(checkpointBytes)
+		parquetReader, err := file.NewParquetReader(bytesReader)
 		if err != nil {
 			return err
 		}
-		for j := int64(0); j < record.NumRows(); j++ {
-			err = processEntryAction(entries[j])
-			if err != nil {
-				return err
+		defer func() {
+			if err := parquetReader.Close(); err != nil {
+				returnErr = errors.Join(errors.New("failed to close Parquet reader"), err)
+			}
+		}()
+
+		parquetSchema := parquetReader.MetaData().Schema
+		columnFilter = make([]int, 0, 150)
+		for i := 0; i < parquetSchema.NumColumns(); i++ {
+			columnPath := parquetSchema.Column(i).ColumnPath().String()
+			if !strings.HasPrefix(columnPath, "add") && !strings.HasPrefix(columnPath, "remove") {
+				columnFilter = append(columnFilter, i)
 			}
 		}
-		if err != nil {
-			return err
-		}
+	}
+
+	// Process all checkpoint entries
+	arrowSchema, err := processCheckpointEntriesFromBytes(checkpointBytes, fieldExclusions, columnFilter, processEntryAction)
+	if err != nil {
+		return err
 	}
 
 	// Save the part file for on disk optimization
@@ -496,6 +536,7 @@ func (tableState *TableState) processCheckpointBytes(checkpointBytes []byte, par
 
 		// Store the number of add and remove records locally
 		// These counts are required later for generating new checkpoints
+		// Pass the arrowSchema we already obtained to avoid re-reading
 		err = countAddsAndTombstones(tableState, checkpointBytes, arrowSchema, nil)
 		if err != nil {
 			return err

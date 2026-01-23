@@ -319,11 +319,6 @@ func countAddsAndTombstones(tableState *TableState, checkpointBytes []byte, arro
 	if allocator == nil {
 		allocator = memory.DefaultAllocator
 	}
-	arrowSchemaDetails := new(tempFileSchemaDetails)
-	err := arrowSchemaDetails.setFromArrowSchema(arrowSchema, nil)
-	if err != nil {
-		return err
-	}
 
 	bytesReader := bytes.NewReader(checkpointBytes)
 	parquetReader, err := file.NewParquetReader(bytesReader)
@@ -337,6 +332,20 @@ func countAddsAndTombstones(tableState *TableState, checkpointBytes []byte, arro
 	}()
 
 	arrowRdr, err := pqarrow.NewFileReader(parquetReader, pqarrow.ArrowReadProperties{Parallel: true, BatchSize: 10}, allocator)
+	if err != nil {
+		return err
+	}
+
+	// If arrowSchema was not provided, read it from the parquet file
+	if arrowSchema == nil {
+		arrowSchema, err = arrowRdr.Schema()
+		if err != nil {
+			return err
+		}
+	}
+
+	arrowSchemaDetails := new(tempFileSchemaDetails)
+	err = arrowSchemaDetails.setFromArrowSchema(arrowSchema, nil)
 	if err != nil {
 		return err
 	}
